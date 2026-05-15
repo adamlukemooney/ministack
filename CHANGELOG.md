@@ -7,6 +7,13 @@ Versioning follows [Semantic Versioning](https://semver.org/).
 
 ---
 
+## [Unreleased]
+
+### Fixed
+- **Nested Lambda→Lambda invocations no longer hang or crash in Docker executor mode.** When one Lambda invoked another (the pattern AWS CDK custom resources rely on, and any direct service-to-service `InvokeCommand` between user Lambdas), the call would either hang for 5 minutes on synchronous invokes or crash the called Lambda's RIE process with `SIGSEGV in rapidcore.(*Server).Invoke` on asynchronous ones. The cause: ministack talks to each Lambda's RIE (Runtime Interface Emulator) container over HTTP, and its dispatch loop would re-send the entire HTTP request on any network error — including hiccups that happen after the request has already been accepted. AWS RIE only handles one invocation at a time, so the duplicate request tripped a known nil-pointer dereference in RIE's own Go code (`Reserve()` returns an "already reserved" error, then the next line unconditionally dereferences a nil response token). The fix is to send the request exactly once: read / parse / log-fetch errors after the request is accepted now bubble up to the caller instead of triggering a retry. Genuine cold-start "connection refused" errors (RIE not listening yet — the request hasn't been sent) still retry, capped at 60 seconds. This restores every CDK construct backed by `cr.Provider` (`PutS3NotificationCustomResource`, `BucketDeployment`, `Custom::S3AutoDeleteObjects`, `Custom::ECRAutoDeleteImages`, SNS Platform Application, …) and direct Lambda→Lambda invocations under `LAMBDA_EXECUTOR=docker`.
+
+---
+
 ## [1.3.42] — 2026-05-16
 
 ### Added

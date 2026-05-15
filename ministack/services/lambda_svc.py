@@ -2013,69 +2013,220 @@ def _docker_cp_dir(container, src_dir: str, dest_dir: str):
     container.put_archive(dest_dir, buf)
 
 
+def _resolve_rie_url(container) -> str | None:
+    """Pick the URL where ministack should POST the invocation event.
+
+    Preference order:
+
+    1. ``LAMBDA_DOCKER_NETWORK`` IP — when set and the container has an
+       allocated IP on that network. Container-to-container routing on a
+       shared user-defined Docker network works whether or not ministack
+       itself runs inside a container, so this is the most portable path.
+
+    2. Any other Docker network IP — used only when ministack is running
+       inside a container. Inside a container, the host port mapping
+       (``127.0.0.1:<host_port>``) is **not** reachable: ``127.0.0.1`` is
+       ministack's own loopback, not the Docker host, so falling back to it
+       would either connect to ministack itself or fail. Wait for an IP
+       instead.
+
+    3. ``127.0.0.1:<host_port>`` — only when ministack is running on the
+       host (not inside a container), via Docker's published port mapping.
+
+    Returns ``None`` if the network info / port mapping isn't yet populated
+    (cold-start race); the caller should retry shortly.
+    """
+    networks = container.attrs.get("NetworkSettings", {}).get("Networks", {}) or {}
+    if LAMBDA_DOCKER_NETWORK:
+        ip = networks.get(LAMBDA_DOCKER_NETWORK, {}).get("IPAddress", "")
+        if ip:
+            return f"http://{ip}:8080/2015-03-31/functions/function/invocations"
+    if _running_in_container():
+        for net_info in networks.values():
+            ip = net_info.get("IPAddress", "")
+            if ip:
+                return f"http://{ip}:8080/2015-03-31/functions/function/invocations"
+        return None
+    ports = container.ports.get("8080/tcp") or []
+    if not ports:
+        return None
+    return f"http://127.0.0.1:{ports[0]['HostPort']}/2015-03-31/functions/function/invocations"
+
+
+def _safe_container_logs(container, since: float | None = None) -> str:
+    """Best-effort container log fetch — never raises into the invoke result path.
+    docker-py occasionally errors on logs() when the daemon is busy; we don't
+    want that to mask a successful invocation (or, worse, get retried as if
+    it were a connection failure)."""
+    try:
+        kwargs: dict = {"stdout": True, "stderr": True}
+        if since is not None:
+            kwargs["since"] = since
+        return container.logs(**kwargs).decode("utf-8", errors="replace").strip()
+    except Exception:
+        return ""
+
+
+# Cold-start connect window. Capped independently of function Timeout so a
+# 300s function deadline doesn't translate to 300s of pre-invoke retry.
+_RIE_CONNECT_TIMEOUT_MIN = 5
+_RIE_CONNECT_TIMEOUT_MAX = 60
+
+
 def _invoke_rie(container, event: dict, timeout: int) -> dict:
-    """POST event to a running RIE container's HTTP endpoint."""
+    """POST event to a running RIE container's HTTP endpoint.
+
+    Phased to avoid duplicate invocations:
+
+    1. **Connect phase** — poll for RIE readiness on the container's HTTP
+       port. ``ConnectionRefused`` (RIE not yet bound) and equivalent
+       URLErrors retry with a short sleep, capped at
+       ``min(60s, max(timeout, 5s))``. Other errors bail.
+
+    2. **Invoke phase** — once a TCP connection is accepted, exactly ONE
+       invoke is issued. Read / parse / log-fetch errors after that point
+       are returned to the caller; re-issuing the request would duplicate
+       handler execution.
+
+    The "no re-invoke" rule is the fix for the nested Lambda→Lambda
+    invocation bug. AWS RIE's ``rapidcore.(*Server).Invoke`` panics with a
+    nil-pointer dereference when ``Reserve()`` returns
+    ``ErrAlreadyReserved`` — a second HTTP POST that arrives while the first
+    invoke is still being processed dereferences a nil ``reserveResp``
+    (see ``rapidcore/server.go`` at v1.35: ``reserveResp.Token.FunctionTimeout``
+    runs unconditionally after the error log). That panic surfaces in
+    ministack logs as ``SIGSEGV in rapidcore.(*Server).Invoke``. The
+    previous blanket ``except (URLError, ConnectionRefusedError, OSError):
+    continue`` would retry on ``socket.timeout`` and ``ConnectionResetError``
+    mid-read — exactly the pattern that triggers the RIE crash whenever a
+    Lambda's SDK call holds the parent connection open long enough for its
+    nested callee to be dispatched and the response stream to hiccup.
+
+    For sync invokes the same retry loop would also hang the parent
+    invocation up to 5 minutes by re-firing urlopen() after socket.timeout,
+    until the parent RIE's hardcoded reset deadline kicked in.
+    """
     import urllib.request
-    max_attempts = int(timeout * 10) + 20
-    for _attempt in range(max_attempts):
+
+    connect_deadline = time.time() + max(
+        _RIE_CONNECT_TIMEOUT_MIN,
+        min(_RIE_CONNECT_TIMEOUT_MAX, int(timeout)),
+    )
+
+    rie_url: str | None = None
+    invoke_time: float | None = None
+    resp = None
+    last_connect_err: Exception | None = None
+
+    while time.time() < connect_deadline:
         container.reload()
         if container.status != "running":
-            break
+            stdout = _safe_container_logs(container)
+            return {
+                "body": {
+                    "errorMessage": f"Lambda container exited before RIE accepted invoke: {stdout[:500]}",
+                    "errorType": "Runtime.ExitError",
+                },
+                "error": True, "log": stdout,
+            }
+
+        rie_url = _resolve_rie_url(container)
+        if rie_url is None:
+            # Network / port mapping not populated yet — re-poll shortly.
+            time.sleep(0.1)
+            continue
+
         try:
-            networks = container.attrs.get("NetworkSettings", {}).get("Networks", {})
-            # Try Docker network first (container-to-container)
-            container_ip = None
-            if LAMBDA_DOCKER_NETWORK:
-                container_ip = networks.get(LAMBDA_DOCKER_NETWORK, {}).get("IPAddress", "")
-            if not container_ip and _running_in_container():
-                # DinD: host-mapped ports aren't reachable from inside this container.
-                # Use the Lambda container's IP on any available Docker network.
-                for net_info in networks.values():
-                    ip = net_info.get("IPAddress", "")
-                    if ip:
-                        container_ip = ip
-                        break
-            if container_ip:
-                rie_url = f"http://{container_ip}:8080/2015-03-31/functions/function/invocations"
-            else:
-                ports = container.ports.get("8080/tcp") or []
-                if not ports:
-                    continue
-                rie_url = f"http://127.0.0.1:{ports[0]['HostPort']}/2015-03-31/functions/function/invocations"
             invoke_time = time.time()
             req = urllib.request.Request(
                 rie_url, data=json.dumps(event).encode(),
                 headers={"Content-Type": "application/json"},
             )
             resp = urllib.request.urlopen(req, timeout=timeout)
-            body = resp.read().decode("utf-8", errors="replace")
-            try:
-                parsed = json.loads(body)
-            except json.JSONDecodeError:
-                parsed = body
-            logs = container.logs(stdout=True, stderr=True, since=invoke_time).decode("utf-8", errors="replace").strip()
-            # RIE sets 'Lambda-Runtime-Function-Error-Type' (or bare
-            # 'X-Amz-Function-Error') when the handler raised an unhandled
-            # exception. If it's set we surface the error flag + propagate the
-            # exact AWS-style marker so _invoke can emit the right header.
-            err_header = (resp.headers.get("X-Amz-Function-Error")
-                          or resp.headers.get("Lambda-Runtime-Function-Error-Type") or "")
-            result = {"body": parsed, "log": logs}
-            if err_header or (isinstance(parsed, dict) and parsed.get("errorType")):
-                # errorType without an X-Amz header means the handler returned
-                # an error-shaped payload itself — AWS signals this as Handled.
-                result["error"] = True
-                result["function_error"] = "Unhandled" if err_header else "Handled"
-            return result
-        except (urllib.error.URLError, ConnectionRefusedError, OSError):
+            break
+        except (ConnectionRefusedError, ConnectionResetError) as e:
+            last_connect_err = e
             time.sleep(0.1)
             continue
-    # Timed out
-    stdout = container.logs(stdout=True, stderr=True).decode("utf-8", errors="replace").strip()
-    return {
-        "body": {"errorMessage": f"Lambda RIE failed: {stdout[:500]}", "errorType": "Runtime.ExitError"},
-        "error": True, "log": stdout,
-    }
+        except urllib.error.URLError as e:
+            reason = getattr(e, "reason", None)
+            if isinstance(reason, (ConnectionRefusedError, ConnectionResetError)):
+                last_connect_err = e
+                time.sleep(0.1)
+                continue
+            stdout = _safe_container_logs(container)
+            return {
+                "body": {
+                    "errorMessage": f"Lambda RIE unreachable at {rie_url}: {e}",
+                    "errorType": "Runtime.ConnectionError",
+                },
+                "error": True, "log": stdout,
+            }
+        except OSError as e:
+            # Bare socket.timeout / TimeoutError (TimeoutError <: OSError) or
+            # other low-level OSError that didn't get wrapped in URLError.
+            # Treat as terminal — do NOT retry, since retrying after urlopen
+            # has handed off the TCP connection could send a duplicate request
+            # and trip the rapidcore.(*Server).Invoke nil-deref.
+            stdout = _safe_container_logs(container)
+            return {
+                "body": {
+                    "errorMessage": f"Lambda RIE invoke failed at {rie_url}: {e}",
+                    "errorType": "Runtime.ConnectionError",
+                },
+                "error": True, "log": stdout,
+            }
+
+    if resp is None:
+        stdout = _safe_container_logs(container)
+        return {
+            "body": {
+                "errorMessage": (
+                    f"Lambda RIE never accepted invocations at {rie_url or '<unresolved>'} "
+                    f"(last error: {last_connect_err}): {stdout[:500]}"
+                ),
+                "errorType": "Runtime.ExitError",
+            },
+            "error": True, "log": stdout,
+        }
+
+    # Invoke accepted by RIE. From here on, do NOT re-issue the request —
+    # see docstring re: rapidcore.(*Server).Invoke nil-deref.
+    try:
+        body = resp.read().decode("utf-8", errors="replace")
+    except OSError as e:
+        stdout = _safe_container_logs(container, since=invoke_time)
+        return {
+            "body": {
+                "errorMessage": f"Lambda RIE read failed mid-response: {e}",
+                "errorType": "Runtime.HandlerError",
+            },
+            "error": True, "log": stdout,
+        }
+
+    try:
+        parsed = json.loads(body)
+    except json.JSONDecodeError:
+        parsed = body
+
+    logs = _safe_container_logs(container, since=invoke_time)
+
+    # RIE sets 'Lambda-Runtime-Function-Error-Type' (or bare
+    # 'X-Amz-Function-Error') when the handler raised an unhandled exception.
+    # If it's set we surface the error flag + propagate the exact AWS-style
+    # marker so _invoke can emit the right header.
+    err_header = (
+        resp.headers.get("X-Amz-Function-Error")
+        or resp.headers.get("Lambda-Runtime-Function-Error-Type")
+        or ""
+    )
+    result = {"body": parsed, "log": logs}
+    if err_header or (isinstance(parsed, dict) and parsed.get("errorType")):
+        # errorType without an X-Amz header means the handler returned an
+        # error-shaped payload itself — AWS signals this as Handled.
+        result["error"] = True
+        result["function_error"] = "Unhandled" if err_header else "Handled"
+    return result
 
 
 def _parse_docker_flags(flags: str) -> dict:
