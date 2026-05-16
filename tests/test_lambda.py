@@ -2405,6 +2405,31 @@ def _mk_container(running: bool = True):
     return c
 
 
+def _mk_container_with_attrs(running=True, network_ip=None, network_name=None,
+                              host_port=None):
+    """Fake container with the docker-py attrs/ports shape that _resolve_rie_url reads."""
+    c = _mk_container(running=running)
+    networks = {}
+    if network_name and network_ip:
+        networks[network_name] = {"IPAddress": network_ip}
+    c.attrs = {"NetworkSettings": {"Networks": networks}}
+    c.ports = {}
+    if host_port:
+        c.ports = {"8080/tcp": [{"HostPort": str(host_port)}]}
+    c.logs.return_value = b""
+    return c
+
+
+def _fake_urlopen_response(body: bytes, headers: dict | None = None):
+    """Mimic urlopen()'s return value: .read() + .headers."""
+    r = MagicMock()
+    r.read.return_value = body
+    headers_obj = MagicMock()
+    headers_obj.get.side_effect = lambda k, default=None: (headers or {}).get(k, default)
+    r.headers = headers_obj
+    return r
+
+
 # ──────────────────────────────── pool key ──────────────────────────────────
 
 def test_pool_key_scopes_by_account():
@@ -2871,37 +2896,7 @@ def test_invoke_rie_classifies_unhandled_vs_handled():
     assert classification == "Handled"
 
 
-# ──────────────────── _resolve_rie_url + _invoke_rie unit tests ────────────────
-#
-# Regression coverage for the nested Lambda→Lambda invoke bug. Before the fix,
-# _invoke_rie retried on any OSError — including socket.timeout and
-# ConnectionResetError raised *after* urlopen returned. The retry would
-# re-POST to RIE while the first invocation was still in flight; RIE's
-# Reserve() then returned ErrAlreadyReserved and rapidcore/server.go:665
-# dereferenced a nil `reserveResp.Token.FunctionTimeout`, panicking with what
-# ministack logs as "SIGSEGV in rapidcore.(*Server).Invoke". These tests pin
-# the fix:
-#   * urlopen-success → response read failure does NOT re-invoke
-#   * urlopen connection refused DOES retry (RIE cold start)
-#   * container-IP race resolves cleanly without falling to 127.0.0.1:host_port
-#     inside a container (which would either hit ministack itself or fail)
-# ============================================================================
-
-def _mk_container_with_attrs(running=True, network_ip=None, network_name=None,
-                              host_port=None):
-    """Build a MagicMock container with the docker-py attrs/ports shape that
-    _resolve_rie_url reads. Defaults to nothing populated."""
-    c = _mk_container(running=running)
-    networks = {}
-    if network_name and network_ip:
-        networks[network_name] = {"IPAddress": network_ip}
-    c.attrs = {"NetworkSettings": {"Networks": networks}}
-    c.ports = {}
-    if host_port:
-        c.ports = {"8080/tcp": [{"HostPort": str(host_port)}]}
-    c.logs.return_value = b""
-    return c
-
+# ──────────────── _resolve_rie_url + _invoke_rie unit tests ─────────────────
 
 def test_resolve_rie_url_prefers_lambda_docker_network(monkeypatch):
     """When LAMBDA_DOCKER_NETWORK is set and the container has an IP on that
@@ -2925,12 +2920,8 @@ def test_resolve_rie_url_dind_walks_other_networks_when_lambda_net_unset(monkeyp
 
 
 def test_resolve_rie_url_dind_never_falls_back_to_127_0_0_1(monkeypatch):
-    """When ministack is in a container and no container IP is allocated yet,
-    _resolve_rie_url returns None so the caller retries — it must NOT fall
-    through to 127.0.0.1:<host_port>, which inside a container points at
-    ministack's own loopback (typically hitting ministack itself or
-    erroring). This is the cold-start race window after `containers.run()`
-    returns but before the network namespace is populated."""
+    """Inside a container, 127.0.0.1 is ministack's own loopback, not the Docker host.
+    When no container IP is allocated yet, return None so the caller retries instead."""
     monkeypatch.setattr(lsvc, "LAMBDA_DOCKER_NETWORK", "")
     monkeypatch.setattr(lsvc, "_running_in_container", lambda: True)
     c = _mk_container_with_attrs(host_port=49152)  # host_port mapped, but no network IPs
@@ -2955,26 +2946,10 @@ def test_resolve_rie_url_returns_none_when_no_port_and_no_ip(monkeypatch):
     assert lsvc._resolve_rie_url(c) is None
 
 
-def _fake_urlopen_response(body: bytes, headers: dict | None = None):
-    """Construct a MagicMock that mimics urlopen()'s return: .read() + .headers."""
-    r = MagicMock()
-    r.read.return_value = body
-    headers_obj = MagicMock()
-    headers_obj.get.side_effect = lambda k, default=None: (headers or {}).get(k, default)
-    r.headers = headers_obj
-    return r
-
-
 def test_invoke_rie_does_not_retry_after_successful_urlopen(monkeypatch):
-    """Regression: socket.timeout / ConnectionResetError raised by resp.read()
-    after a successful urlopen MUST surface as an error to the caller — it
-    must NOT trigger a second urlopen.
-
-    Why: a second POST to RIE while the first invocation is still in flight
-    trips a known nil-pointer-deref in `rapidcore.(*Server).Invoke`
-    (Reserve() returns ErrAlreadyReserved, then the line
-    `reserveResp.Token.FunctionTimeout.Nanoseconds()` dereferences nil).
-    """
+    """Regression: read error after a successful urlopen must NOT cause a second POST.
+    A duplicate request to RIE while the first invoke is in-flight trips the
+    nil-deref crash in rapidcore.(*Server).Invoke."""
     monkeypatch.setattr(lsvc, "LAMBDA_DOCKER_NETWORK", "")
     monkeypatch.setattr(lsvc, "_running_in_container", lambda: False)
     container = _mk_container_with_attrs(host_port=49152)
@@ -3003,10 +2978,8 @@ def test_invoke_rie_does_not_retry_after_successful_urlopen(monkeypatch):
 
 
 def test_invoke_rie_does_not_retry_on_url_timeout(monkeypatch):
-    """Regression: when urlopen itself raises socket.timeout (handler too
-    slow) we surface the timeout to the caller. Retrying would duplicate
-    the invocation and could trip the nil-deref crash if RIE is still
-    processing the first one."""
+    """Regression: urlopen raising socket.timeout must surface as an error — not trigger
+    a retry. Retrying would duplicate the invocation and risk the nil-deref crash."""
     monkeypatch.setattr(lsvc, "LAMBDA_DOCKER_NETWORK", "")
     monkeypatch.setattr(lsvc, "_running_in_container", lambda: False)
     container = _mk_container_with_attrs(host_port=49152)
@@ -3058,11 +3031,8 @@ def test_invoke_rie_retries_connection_refused_during_cold_start(monkeypatch):
 
 
 def test_invoke_rie_connect_window_is_bounded_for_long_timeouts(monkeypatch):
-    """Connection-establishment retry window is capped at 60s even when the
-    function Timeout is much higher (e.g. 300s for cr.Provider framework).
-    Without this cap, an unreachable container IP would keep
-    re-trying ConnectionRefused for the full function timeout, hiding the
-    network failure until the parent invocation's deadline fires."""
+    """Cold-start connect window is capped independently of function Timeout so
+    a 300s function deadline doesn't translate to 300s of ConnectionRefused retries."""
     monkeypatch.setattr(lsvc, "LAMBDA_DOCKER_NETWORK", "")
     monkeypatch.setattr(lsvc, "_running_in_container", lambda: False)
     # Tighten both bounds so the test runs in <2s instead of 5+.
@@ -3108,10 +3078,8 @@ def test_invoke_rie_returns_error_when_container_exits_before_invoke(monkeypatch
 
 
 def test_invoke_rie_waits_for_container_ip_inside_container(monkeypatch):
-    """DinD cold-start race: container is 'running' but the network namespace
-    isn't populated yet. _resolve_rie_url returns None on the first poll;
-    the loop must wait for the IP to appear instead of falling through to
-    127.0.0.1:host_port (unreachable from inside our container)."""
+    """DinD: container is 'running' but network namespace not yet populated.
+    Loop must wait for IP to appear rather than falling through to 127.0.0.1:host_port."""
     monkeypatch.setattr(lsvc, "LAMBDA_DOCKER_NETWORK", "houston-net")
     monkeypatch.setattr(lsvc, "_running_in_container", lambda: True)
 

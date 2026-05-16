@@ -2076,35 +2076,9 @@ _RIE_CONNECT_TIMEOUT_MAX = 60
 def _invoke_rie(container, event: dict, timeout: int) -> dict:
     """POST event to a running RIE container's HTTP endpoint.
 
-    Phased to avoid duplicate invocations:
-
-    1. **Connect phase** — poll for RIE readiness on the container's HTTP
-       port. ``ConnectionRefused`` (RIE not yet bound) and equivalent
-       URLErrors retry with a short sleep, capped at
-       ``min(60s, max(timeout, 5s))``. Other errors bail.
-
-    2. **Invoke phase** — once a TCP connection is accepted, exactly ONE
-       invoke is issued. Read / parse / log-fetch errors after that point
-       are returned to the caller; re-issuing the request would duplicate
-       handler execution.
-
-    The "no re-invoke" rule is the fix for the nested Lambda→Lambda
-    invocation bug. AWS RIE's ``rapidcore.(*Server).Invoke`` panics with a
-    nil-pointer dereference when ``Reserve()`` returns
-    ``ErrAlreadyReserved`` — a second HTTP POST that arrives while the first
-    invoke is still being processed dereferences a nil ``reserveResp``
-    (see ``rapidcore/server.go`` at v1.35: ``reserveResp.Token.FunctionTimeout``
-    runs unconditionally after the error log). That panic surfaces in
-    ministack logs as ``SIGSEGV in rapidcore.(*Server).Invoke``. The
-    previous blanket ``except (URLError, ConnectionRefusedError, OSError):
-    continue`` would retry on ``socket.timeout`` and ``ConnectionResetError``
-    mid-read — exactly the pattern that triggers the RIE crash whenever a
-    Lambda's SDK call holds the parent connection open long enough for its
-    nested callee to be dispatched and the response stream to hiccup.
-
-    For sync invokes the same retry loop would also hang the parent
-    invocation up to 5 minutes by re-firing urlopen() after socket.timeout,
-    until the parent RIE's hardcoded reset deadline kicked in.
+    Two-phase: (1) retry ConnectionRefused until RIE binds (connect phase,
+    capped by ``_RIE_CONNECT_TIMEOUT_MIN/MAX``); (2) exactly ONE invoke —
+    never re-issue after the TCP connection is accepted.
     """
     import urllib.request
 
@@ -2190,8 +2164,10 @@ def _invoke_rie(container, event: dict, timeout: int) -> dict:
             "error": True, "log": stdout,
         }
 
-    # Invoke accepted by RIE. From here on, do NOT re-issue the request —
-    # see docstring re: rapidcore.(*Server).Invoke nil-deref.
+    # Invoke accepted by RIE. From here on, do NOT re-issue the request — a
+    # second POST while RIE is still processing the first causes Reserve() to
+    # return ErrAlreadyReserved; rapidcore/server.go then dereferences nil
+    # reserveResp, crashing the container with SIGSEGV.
     try:
         body = resp.read().decode("utf-8", errors="replace")
     except OSError as e:
