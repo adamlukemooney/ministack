@@ -2093,6 +2093,193 @@ def test_apigwv2_extract_lambda_ref_matrix():
         assert qualifier == expected_q, f"{uri!r} → qualifier={qualifier!r}, expected {expected_q!r}"
 
 
+# ──────────────────── route selection specificity ─────────────────────────
+
+def test_apigwv2_path_specificity_scoring():
+    """Literal > {param} > {param+}, left-to-right, longer paths break shorter."""
+    from ministack.services.apigateway import _path_specificity as spec
+
+    assert spec("/things/special") == (2, 2)
+    assert spec("/things/{id}") == (2, 1)
+    assert spec("/things/{proxy+}") == (2, 0)
+    assert spec("/") == ()
+    # Lexicographic comparison handles all the orderings we care about:
+    assert spec("/things/special") > spec("/things/{id}")
+    assert spec("/things/{id}") > spec("/things/{proxy+}")
+    assert spec("/a/b/c") > spec("/a/b")  # longer path with same prefix wins
+
+
+def test_apigwv2_match_route_literal_beats_param_sibling():
+    """Regression: a literal child route must shadow a {param} sibling, regardless
+    of which was created first (#bug-routes-prioritize-literal).
+
+    Real AWS HTTP API v2 selects ``GET /things/special`` over ``GET /things/{id}``
+    for a request to ``/things/special``. Pre-fix, ministack picked whichever
+    matched first in dict-insertion order, so a CDK redeploy could silently
+    swap the matched route under the same URL.
+    """
+    from ministack.core.responses import set_request_account_id
+    from ministack.services import apigateway as apigw_mod
+
+    set_request_account_id("000000000000")
+    api_id = f"ut-spec-{_uuid_mod.uuid4().hex[:8]}"
+    try:
+        # Create the {id} route FIRST so dict-insertion order would have made
+        # it win in the buggy code path.
+        apigw_mod._routes[api_id] = {
+            "r-param": {"routeId": "r-param", "routeKey": "GET /things/{id}",
+                        "target": "integrations/i1"},
+            "r-lit": {"routeId": "r-lit", "routeKey": "GET /things/special",
+                      "target": "integrations/i2"},
+        }
+        route = apigw_mod._match_route(api_id, "GET", "/things/special")
+        assert route is not None
+        assert route["routeKey"] == "GET /things/special", (
+            f"literal sibling lost to {{id}}: got {route['routeKey']!r}"
+        )
+        # Sanity: a non-literal URL still resolves to the parametric route.
+        route = apigw_mod._match_route(api_id, "GET", "/things/abc123")
+        assert route["routeKey"] == "GET /things/{id}"
+    finally:
+        apigw_mod._routes.pop(api_id, None)
+
+
+def test_apigwv2_match_route_specificity_table():
+    """Table-driven coverage for the AWS HTTP API v2 selection algorithm:
+    literal > {param} > {param+}, with left-to-right segment dominance."""
+    from ministack.core.responses import set_request_account_id
+    from ministack.services import apigateway as apigw_mod
+
+    set_request_account_id("000000000000")
+    api_id = f"ut-tab-{_uuid_mod.uuid4().hex[:8]}"
+    route_keys = [
+        "GET /pets/{petId}",
+        "GET /pets/dog/1",
+        "GET /pets/dog/{id}",
+        "GET /pets/{proxy+}",
+        "POST /pets/dog/1",
+    ]
+    try:
+        apigw_mod._routes[api_id] = {
+            f"r{i}": {"routeId": f"r{i}", "routeKey": rk, "target": "integrations/i"}
+            for i, rk in enumerate(route_keys)
+        }
+        cases = [
+            # (method, path, expected routeKey)
+            ("GET", "/pets/dog/1", "GET /pets/dog/1"),
+            ("GET", "/pets/dog/42", "GET /pets/dog/{id}"),
+            ("GET", "/pets/cat", "GET /pets/{petId}"),
+            ("GET", "/pets/cat/extra/segments", "GET /pets/{proxy+}"),
+            ("POST", "/pets/dog/1", "POST /pets/dog/1"),
+        ]
+        for method, path, expected in cases:
+            route = apigw_mod._match_route(api_id, method, path)
+            assert route is not None, f"no match for {method} {path}"
+            assert route["routeKey"] == expected, (
+                f"{method} {path} → {route['routeKey']!r}, expected {expected!r}"
+            )
+    finally:
+        apigw_mod._routes.pop(api_id, None)
+
+
+def test_apigwv2_match_route_exact_method_beats_any():
+    """When two routes share the same path, exact-method wins over ANY."""
+    from ministack.core.responses import set_request_account_id
+    from ministack.services import apigateway as apigw_mod
+
+    set_request_account_id("000000000000")
+    api_id = f"ut-any-{_uuid_mod.uuid4().hex[:8]}"
+    try:
+        apigw_mod._routes[api_id] = {
+            "r-any": {"routeId": "r-any", "routeKey": "ANY /thing", "target": "i1"},
+            "r-get": {"routeId": "r-get", "routeKey": "GET /thing", "target": "i2"},
+        }
+        route = apigw_mod._match_route(api_id, "GET", "/thing")
+        assert route["routeKey"] == "GET /thing"
+        # Other methods still fall through to ANY.
+        route = apigw_mod._match_route(api_id, "DELETE", "/thing")
+        assert route["routeKey"] == "ANY /thing"
+    finally:
+        apigw_mod._routes.pop(api_id, None)
+
+
+def test_apigwv2_literal_sibling_route_invokes_correct_lambda(apigw, lam):
+    """End-to-end: a literal child route declared alongside a ``{id}`` sibling
+    routes its request to the literal route's integration, not the parametric
+    one. Live-server analogue of the unit tests above."""
+    import urllib.request as _urlreq
+
+    fname_lit = f"intg-lit-{_uuid_mod.uuid4().hex[:8]}"
+    fname_param = f"intg-param-{_uuid_mod.uuid4().hex[:8]}"
+    code_lit = (
+        "import json\n"
+        "def handler(event, context):\n"
+        "    return {'statusCode': 200, 'body': json.dumps({'who': 'literal',"
+        "        'routeKey': event.get('routeKey'),"
+        "        'pathParameters': event.get('pathParameters')})}\n"
+    )
+    code_param = (
+        "import json\n"
+        "def handler(event, context):\n"
+        "    return {'statusCode': 200, 'body': json.dumps({'who': 'param',"
+        "        'routeKey': event.get('routeKey'),"
+        "        'pathParameters': event.get('pathParameters')})}\n"
+    )
+    for fname, code in ((fname_lit, code_lit), (fname_param, code_param)):
+        lam.create_function(
+            FunctionName=fname,
+            Runtime="python3.12",
+            Role=_LAMBDA_ROLE,
+            Handler="index.handler",
+            Code={"ZipFile": _make_zip(code)},
+        )
+
+    api_id = apigw.create_api(Name=f"sib-api-{fname_lit}", ProtocolType="HTTP")["ApiId"]
+    int_param = apigw.create_integration(
+        ApiId=api_id, IntegrationType="AWS_PROXY",
+        IntegrationUri=f"arn:aws:lambda:us-east-1:000000000000:function:{fname_param}",
+        PayloadFormatVersion="2.0",
+    )["IntegrationId"]
+    int_lit = apigw.create_integration(
+        ApiId=api_id, IntegrationType="AWS_PROXY",
+        IntegrationUri=f"arn:aws:lambda:us-east-1:000000000000:function:{fname_lit}",
+        PayloadFormatVersion="2.0",
+    )["IntegrationId"]
+    # Param route declared FIRST so dict-insertion order would shadow the
+    # literal under the pre-fix matcher.
+    apigw.create_route(ApiId=api_id, RouteKey="GET /things/{id}",
+                       Target=f"integrations/{int_param}")
+    apigw.create_route(ApiId=api_id, RouteKey="GET /things/special",
+                       Target=f"integrations/{int_lit}")
+    apigw.create_stage(ApiId=api_id, StageName="$default")
+
+    try:
+        url = f"http://{api_id}.execute-api.localhost:{_EXECUTE_PORT}/$default/things/special"
+        req = _urlreq.Request(url, method="GET")
+        req.add_header("Host", f"{api_id}.execute-api.localhost:{_EXECUTE_PORT}")
+        resp = _urlreq.urlopen(req, timeout=30)
+        assert resp.status == 200
+        body = json.loads(resp.read())
+        assert body["who"] == "literal", (
+            f"literal route was shadowed; lambda saw routeKey={body.get('routeKey')!r}"
+        )
+        assert body["routeKey"] == "GET /things/special"
+        assert body["pathParameters"] is None or body["pathParameters"] == {}
+
+        # And the parametric route still works for non-matching URLs.
+        url = f"http://{api_id}.execute-api.localhost:{_EXECUTE_PORT}/$default/things/abc123"
+        req = _urlreq.Request(url, method="GET")
+        req.add_header("Host", f"{api_id}.execute-api.localhost:{_EXECUTE_PORT}")
+        resp = _urlreq.urlopen(req, timeout=30)
+        body = json.loads(resp.read())
+        assert body["who"] == "param"
+        assert body["pathParameters"] == {"id": "abc123"}
+    finally:
+        apigw.delete_api(ApiId=api_id)
+        lam.delete_function(FunctionName=fname_lit)
+        lam.delete_function(FunctionName=fname_param)
+
+
 def test_apigw_lambda_proxy_emits_cloudwatch_logs(apigw, lam, logs):
     """Lambda invoked via API Gateway v2 proxy must emit CloudWatch Logs."""
     import urllib.request as _urlreq

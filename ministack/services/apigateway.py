@@ -868,23 +868,56 @@ async def handle_execute(api_id, stage, path, method, headers, body, query_param
 
 
 def _match_route(api_id, method, path):
-    """Find the best matching route for method+path. $default route is the fallback."""
+    """Find the best matching route for method+path. $default route is the fallback.
+
+    AWS HTTP API v2 picks the *most specific* match, not the first declared:
+    literal segments outrank ``{param}``, which outrank greedy ``{param+}``;
+    earlier (leftmost) segments dominate later ones; longer paths win when the
+    leading prefixes tie. Exact-method match (``GET``) beats ``ANY``.
+    """
     routes = _routes.get(api_id, {})
-    # First pass: look for a specific method+path match (skip $default)
+    best = None
+    best_spec: tuple | None = None
     for route in routes.values():
         key = route.get("routeKey", "")
         if key == "$default":
             continue
         parts = key.split(" ", 1)
-        if len(parts) == 2:
-            r_method, r_path = parts
-            if (r_method == "ANY" or r_method == method) and _path_matches(r_path, path):
-                return route
-    # Second pass: $default catch-all
+        if len(parts) != 2:
+            continue
+        r_method, r_path = parts
+        if r_method != "ANY" and r_method != method:
+            continue
+        if not _path_matches(r_path, path):
+            continue
+        spec = (_path_specificity(r_path), 0 if r_method == "ANY" else 1)
+        if best_spec is None or spec > best_spec:
+            best = route
+            best_spec = spec
+    if best is not None:
+        return best
     for route in routes.values():
         if route.get("routeKey") == "$default":
             return route
     return None
+
+
+def _path_specificity(route_path: str) -> tuple[int, ...]:
+    """Per-segment specificity tuple for a route path.
+
+    Literal=2, ``{param}``=1, greedy ``{param+}``=0. Tuple comparison naturally
+    encodes "earlier segments matter more" and "longer paths beat shorter ones
+    when the shared prefix is equal".
+    """
+    out = []
+    for seg in route_path.split("/"):
+        if not seg:
+            continue
+        if seg.startswith("{") and seg.endswith("}"):
+            out.append(0 if seg[1:-1].endswith("+") else 1)
+        else:
+            out.append(2)
+    return tuple(out)
 
 
 def _extract_path_params(route_path: str, request_path: str) -> dict | None:
