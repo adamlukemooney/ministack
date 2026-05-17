@@ -4294,6 +4294,33 @@ def _poll_loop():
         time.sleep(1 if _esms else 5)
 
 
+def _sqs_attrs_to_lambda_shape(attrs: dict) -> dict:
+    """Convert SQS MessageAttributes from the SDK PascalCase shape to the
+    camelCase shape Lambda receives in real AWS SQS events.
+
+    AWS stores attributes as {StringValue, BinaryValue, DataType, …} on the
+    wire, but when SQS delivers a batch to Lambda it lowercases the first
+    letter of each field. Handlers written against the real Lambda SQS event
+    shape (e.g. ``record["messageAttributes"]["x"]["stringValue"]``) would
+    otherwise see ``KeyError`` here.
+    """
+    out: dict = {}
+    if not attrs:
+        return out
+    for name, val in attrs.items():
+        if not isinstance(val, dict):
+            out[name] = val
+            continue
+        shaped: dict = {}
+        for k, v in val.items():
+            if not k:
+                shaped[k] = v
+                continue
+            shaped[k[0].lower() + k[1:]] = v
+        out[name] = shaped
+    return out
+
+
 def _poll_sqs():
     from ministack.services import sqs as _sqs
 
@@ -4337,7 +4364,7 @@ def _poll_sqs():
                     "SenderId": get_account_id(),
                     "ApproximateFirstReceiveTimestamp": str(int(first_recv * 1000)),
                 },
-                "messageAttributes": msg.get("message_attributes", {}),
+                "messageAttributes": _sqs_attrs_to_lambda_shape(msg.get("message_attributes") or {}),
                 "md5OfBody": msg.get("md5_body") or msg.get("md5") or "",
                 "eventSource": "aws:sqs",
                 "eventSourceARN": source_arn,
