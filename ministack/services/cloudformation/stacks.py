@@ -55,6 +55,105 @@ def _add_event(stack_id, stack_name, logical_id, resource_type, status,
 # Stack Deploy / Delete / Update Logic
 # ===========================================================================
 
+_IMPORT_WAIT_TIMEOUT_S = 15.0
+_IMPORT_WAIT_POLL_S = 0.1
+
+
+def _collect_import_names(node) -> set:
+    """Walk a CFN value tree and return every literal-string export name a
+    ``Fn::ImportValue`` would resolve. Nested forms whose argument is itself
+    an expression (``Fn::Sub``, ``Ref``, …) are skipped — we can't pre-resolve
+    those without running the full resolver, so we let the per-resource path
+    handle them with the existing error if they're still missing later.
+    """
+    names: set = set()
+    if isinstance(node, dict):
+        for k, v in node.items():
+            if k == "Fn::ImportValue" and isinstance(v, str):
+                names.add(v)
+            else:
+                names.update(_collect_import_names(v))
+    elif isinstance(node, list):
+        for item in node:
+            names.update(_collect_import_names(item))
+    return names
+
+
+def _export_names_in_template(template: dict) -> set:
+    """Return the set of Output.Export.Name strings a template declares."""
+    out: set = set()
+    for out_def in (template.get("Outputs") or {}).values():
+        if not isinstance(out_def, dict):
+            continue
+        export = out_def.get("Export")
+        if isinstance(export, dict):
+            name = export.get("Name")
+            if isinstance(name, str):
+                out.add(name)
+    return out
+
+
+async def _await_imported_exports(template: dict, stack_name: str,
+                                  timeout: float = _IMPORT_WAIT_TIMEOUT_S) -> None:
+    """If this template's ``Fn::ImportValue`` references would land on the
+    Outputs of a sibling stack that is still ``*_IN_PROGRESS``, wait for that
+    sibling to finish before we start provisioning. The common case (no
+    in-flight sibling provides the missing export) returns immediately, so
+    intentionally-bad imports keep failing fast with the canonical
+    "Export not found" message from the resolver.
+
+    Without this, two stacks created in quick succession race each other:
+    the importer would resolve the export only if it happened to be
+    scheduled after the exporter, and downstream service-store lookups
+    (SNS topic by ARN, SQS queue by URL, Lambda by name, …) could silently
+    miss for the same reason — most acutely the SNS Subscription phantom-arn
+    bug, where the topic lookup miss was swallowed by a fabricated ARN.
+    """
+    from ministack.services.cloudformation import _exports, _stacks
+
+    needed = _collect_import_names(template)
+    if not needed:
+        return
+    missing = {n for n in needed if _exports.get(n) is None}
+    if not missing:
+        return
+
+    # Build the in-flight exporter map: only wait for names a sibling stack
+    # has publicly announced it will export AND is still busy creating.
+    in_flight: dict = {}
+    for other_name, other in list(_stacks.items()):
+        if other_name == stack_name:
+            continue
+        status = other.get("StackStatus", "")
+        if not status.endswith("_IN_PROGRESS"):
+            continue
+        other_tpl = other.get("_template") or {}
+        exported = _export_names_in_template(other_tpl)
+        for name in missing & exported:
+            in_flight[name] = other_name
+    if not in_flight:
+        return
+
+    logger.info(
+        "Stack %s: waiting for in-flight sibling stacks to publish exports %s",
+        stack_name, sorted(in_flight),
+    )
+    deadline = time.time() + timeout
+    while time.time() < deadline:
+        await asyncio.sleep(_IMPORT_WAIT_POLL_S)
+        in_flight = {
+            name: src for name, src in in_flight.items()
+            if _exports.get(name) is None
+            and _stacks.get(src, {}).get("StackStatus", "").endswith("_IN_PROGRESS")
+        }
+        if not in_flight:
+            return
+    logger.warning(
+        "Stack %s: sibling-stack exports still pending after %.0fs: %s",
+        stack_name, timeout, sorted(in_flight),
+    )
+
+
 async def _deploy_stack_async(stack_name: str, stack_id: str, template: dict,
                               param_values: dict, disable_rollback: bool,
                               tags: list, is_update: bool = False,
@@ -68,6 +167,11 @@ async def _deploy_stack_async(stack_name: str, stack_id: str, template: dict,
     conditions = _evaluate_conditions(template, param_values)
     resources_defs = template.get("Resources", {})
     outputs_defs = template.get("Outputs", {})
+
+    # Wait briefly for any sibling stacks this template imports from so the
+    # per-resource service-store lookups (SNS topic by ARN, etc.) see the
+    # already-provisioned upstream state instead of racing it.
+    await _await_imported_exports(template, stack_name)
 
     # Topological sort
     try:
