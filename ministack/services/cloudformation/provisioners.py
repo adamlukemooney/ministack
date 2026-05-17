@@ -2967,6 +2967,44 @@ def _apigw_v2_api_create(logical_id, props, stack_name):
     return api_id, {"ApiId": api_id, "ApiEndpoint": api["apiEndpoint"]}
 
 
+def _apigw_v2_api_update(physical_id, old_props, new_props, stack_name):
+    """In-place update of an ApiGatewayV2 Api.
+
+    Without this, every stack redeploy fires ``_apigw_v2_api_create`` — which
+    mints a fresh ``api_id`` — leaving the previous Api (and its routes /
+    integrations / stages) orphaned in memory. Real CFN preserves the Ref-able
+    physical ID across updates for mutable properties; only ``ProtocolType`` is
+    a true replacement trigger, which we don't model separately here.
+
+    Falls back to a fresh create if the previous physical_id can't be located.
+    """
+    api = _apigw_v2._apis.get(physical_id)
+    if api is None:
+        return _apigw_v2_api_create(physical_id, new_props, stack_name)
+    if "Name" in new_props:
+        api["name"] = new_props["Name"]
+    if "ProtocolType" in new_props:
+        api["protocolType"] = new_props["ProtocolType"]
+    if "RouteSelectionExpression" in new_props:
+        api["routeSelectionExpression"] = new_props["RouteSelectionExpression"]
+    if "ApiKeySelectionExpression" in new_props:
+        api["apiKeySelectionExpression"] = new_props["ApiKeySelectionExpression"]
+    if "Tags" in new_props:
+        api["tags"] = new_props["Tags"]
+    if "DisableSchemaValidation" in new_props:
+        api["disableSchemaValidation"] = new_props["DisableSchemaValidation"]
+    if "DisableExecuteApiEndpoint" in new_props:
+        api["disableExecuteApiEndpoint"] = new_props["DisableExecuteApiEndpoint"]
+    if "Version" in new_props:
+        api["version"] = new_props["Version"]
+    if "CorsConfiguration" in new_props:
+        if new_props["CorsConfiguration"]:
+            api["corsConfiguration"] = new_props["CorsConfiguration"]
+        else:
+            api.pop("corsConfiguration", None)
+    return physical_id, {"ApiId": physical_id, "ApiEndpoint": api["apiEndpoint"]}
+
+
 def _apigw_v2_api_delete(physical_id, props):
     _apigw_v2._apis.pop(physical_id, None)
     _apigw_v2._routes.pop(physical_id, None)
@@ -3719,7 +3757,7 @@ _RESOURCE_HANDLERS = {
     "AWS::StepFunctions::StateMachine": {"create": _sfn_state_machine_create, "delete": _sfn_state_machine_delete},
     "AWS::Route53::HostedZone": {"create": _r53_hosted_zone_create, "delete": _r53_hosted_zone_delete},
     "AWS::Route53::RecordSet": {"create": _r53_record_set_create, "delete": _r53_record_set_delete},
-    "AWS::ApiGatewayV2::Api": {"create": _apigw_v2_api_create, "delete": _apigw_v2_api_delete},
+    "AWS::ApiGatewayV2::Api": {"create": _apigw_v2_api_create, "update": _apigw_v2_api_update, "delete": _apigw_v2_api_delete},
     "AWS::ApiGatewayV2::Stage": {"create": _apigw_v2_stage_create, "delete": _apigw_v2_stage_delete},
     "AWS::ApiGatewayV2::Integration": {"create": _apigw_v2_integration_create, "update": _apigw_v2_integration_update, "delete": _apigw_v2_integration_delete},
     "AWS::ApiGatewayV2::Route": {"create": _apigw_v2_route_create, "update": _apigw_v2_route_update, "delete": _apigw_v2_route_delete},

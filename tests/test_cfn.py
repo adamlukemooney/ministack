@@ -2509,16 +2509,15 @@ def test_cfn_apigwv2_route_update_in_place_no_duplicates(cfn, apigw):
     assert stack["StackStatus"] == "CREATE_COMPLETE"
 
     resources = cfn.describe_stack_resources(StackName=stack_name)["StackResources"]
+    initial_api_id = next(r["PhysicalResourceId"] for r in resources
+                          if r["ResourceType"] == "AWS::ApiGatewayV2::Api")
     initial_route_id = next(r["PhysicalResourceId"].split("/", 1)[1] for r in resources
                             if r["ResourceType"] == "AWS::ApiGatewayV2::Route")
     initial_int_id = next(r["PhysicalResourceId"] for r in resources
                           if r["ResourceType"] == "AWS::ApiGatewayV2::Integration")
 
     # Redeploy with a different RouteKey — exact scenario where the old code
-    # left a duplicate behind. The parent Api may itself be replaced (separate
-    # known quirk for ``AWS::ApiGatewayV2::Api`` non-idempotency); the Route +
-    # Integration update handlers move the in-place record under whichever Api
-    # the current stack references.
+    # left a duplicate behind.
     cfn.update_stack(StackName=stack_name, TemplateBody=json.dumps(_tpl("GET /v2")))
     stack = _wait_stack(cfn, stack_name)
     assert stack["StackStatus"] == "UPDATE_COMPLETE"
@@ -2526,6 +2525,10 @@ def test_cfn_apigwv2_route_update_in_place_no_duplicates(cfn, apigw):
     resources_after = cfn.describe_stack_resources(StackName=stack_name)["StackResources"]
     current_api_id = next(r["PhysicalResourceId"] for r in resources_after
                           if r["ResourceType"] == "AWS::ApiGatewayV2::Api")
+    assert current_api_id == initial_api_id, (
+        f"ApiId changed across update ({initial_api_id} → {current_api_id}); "
+        "in-place update should preserve the Api's physical ID"
+    )
 
     routes = apigw.get_routes(ApiId=current_api_id)["Items"]
     assert len(routes) == 1, f"expected 1 route after update, got {len(routes)}: {routes}"
@@ -2545,11 +2548,56 @@ def test_cfn_apigwv2_route_update_in_place_no_duplicates(cfn, apigw):
     # of each — proves the update handler is idempotent across repeated calls.
     cfn.update_stack(StackName=stack_name, TemplateBody=json.dumps(_tpl("GET /v2")))
     _wait_stack(cfn, stack_name)
-    resources_again = cfn.describe_stack_resources(StackName=stack_name)["StackResources"]
-    current_api_id = next(r["PhysicalResourceId"] for r in resources_again
-                          if r["ResourceType"] == "AWS::ApiGatewayV2::Api")
     assert len(apigw.get_routes(ApiId=current_api_id)["Items"]) == 1
     assert len(apigw.get_integrations(ApiId=current_api_id)["Items"]) == 1
+
+    cfn.delete_stack(StackName=stack_name)
+    _wait_stack(cfn, stack_name)
+
+
+def test_cfn_apigwv2_api_update_in_place_preserves_id_and_state(cfn, apigw):
+    """Regression: stack updates that change Api properties must mutate the
+    existing Api in place rather than minting a fresh one. Pre-fix every
+    redeploy left the previous Api (and any routes/integrations under it)
+    orphaned in memory, and the Ref-resolved ApiId pointer changed across
+    deploys."""
+    def _tpl(name: str):
+        return {
+            "AWSTemplateFormatVersion": "2010-09-09",
+            "Resources": {
+                "HttpApi": {
+                    "Type": "AWS::ApiGatewayV2::Api",
+                    "Properties": {"Name": name, "ProtocolType": "HTTP"},
+                },
+            },
+        }
+
+    stack_name = "cfn-apigwv2-api-upd-t01"
+    cfn.create_stack(StackName=stack_name, TemplateBody=json.dumps(_tpl("api-v1")))
+    _wait_stack(cfn, stack_name)
+    resources = cfn.describe_stack_resources(StackName=stack_name)["StackResources"]
+    initial_api_id = next(r["PhysicalResourceId"] for r in resources
+                          if r["ResourceType"] == "AWS::ApiGatewayV2::Api")
+    assert apigw.get_api(ApiId=initial_api_id)["Name"] == "api-v1"
+
+    # Property change — pre-fix, this minted a brand new Api with a new id
+    # and left the old one behind. Now it mutates in place.
+    cfn.update_stack(StackName=stack_name, TemplateBody=json.dumps(_tpl("api-v2")))
+    _wait_stack(cfn, stack_name)
+    resources = cfn.describe_stack_resources(StackName=stack_name)["StackResources"]
+    current_api_id = next(r["PhysicalResourceId"] for r in resources
+                          if r["ResourceType"] == "AWS::ApiGatewayV2::Api")
+    assert current_api_id == initial_api_id, (
+        f"ApiId changed across update ({initial_api_id} → {current_api_id})"
+    )
+    assert apigw.get_api(ApiId=current_api_id)["Name"] == "api-v2"
+
+    # No duplicate of this stack's Api by name — pre-fix, the old Api lingered
+    # alongside the new one.
+    matches = [a for a in apigw.get_apis()["Items"] if a["Name"] in ("api-v1", "api-v2")]
+    assert len(matches) == 1 and matches[0]["ApiId"] == initial_api_id, (
+        f"expected exactly one Api matching the stack's name history, got {matches}"
+    )
 
     cfn.delete_stack(StackName=stack_name)
     _wait_stack(cfn, stack_name)
