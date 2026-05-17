@@ -3021,6 +3021,25 @@ def _cw_metric_alarm_delete(physical_id, props):
 # ApiGatewayV2 Api
 # ---------------------------------------------------------------------------
 
+def _apigw_v2_cors_config_camel(cfg) -> dict:
+    """CFN templates spell CorsConfiguration's inner fields PascalCase
+    (AllowOrigins, AllowMethods, …) per the AWS CFN spec; the apigateway.py
+    v2 store and the boto3 GetApi response model expect camelCase
+    (allowOrigins, allowMethods, …). Storing the values verbatim left
+    ``get_api`` returning an empty CorsConfiguration, which made every
+    browser preflight fail after deploy until a manual ``update-api`` ran.
+    """
+    if not isinstance(cfg, dict) or not cfg:
+        return {}
+    out: dict = {}
+    for k, v in cfg.items():
+        if not k:
+            out[k] = v
+            continue
+        out[k[0].lower() + k[1:]] = v
+    return out
+
+
 def _apigw_v2_api_create(logical_id, props, stack_name):
     api_id = new_uuid()[:8]
     name = props.get("Name") or _physical_name(stack_name, logical_id, max_len=128)
@@ -3039,7 +3058,7 @@ def _apigw_v2_api_create(logical_id, props, stack_name):
         "version": props.get("Version", ""),
     }
     if props.get("CorsConfiguration"):
-        api["corsConfiguration"] = props["CorsConfiguration"]
+        api["corsConfiguration"] = _apigw_v2_cors_config_camel(props["CorsConfiguration"])
     _apigw_v2._apis[api_id] = api
     _apigw_v2._routes[api_id] = {}
     _apigw_v2._integrations[api_id] = {}
@@ -3080,7 +3099,7 @@ def _apigw_v2_api_update(physical_id, old_props, new_props, stack_name):
         api["version"] = new_props["Version"]
     if "CorsConfiguration" in new_props:
         if new_props["CorsConfiguration"]:
-            api["corsConfiguration"] = new_props["CorsConfiguration"]
+            api["corsConfiguration"] = _apigw_v2_cors_config_camel(new_props["CorsConfiguration"])
         else:
             api.pop("corsConfiguration", None)
     return physical_id, {"ApiId": physical_id, "ApiEndpoint": api["apiEndpoint"]}
