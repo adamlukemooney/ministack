@@ -2370,6 +2370,98 @@ Outputs:
     assert not without_resp["UserPoolClient"].get("ClientSecret"), "GenerateSecret=false should leave ClientSecret empty"
 
 
+def test_cfn_cognito_user_pool_userpoolname_honored(cfn, cognito_idp):
+    """Regression: AWS::Cognito::UserPool.UserPoolName (the CFN-spec property
+    name) must be honored. Pre-fix the provisioner only checked PoolName (the
+    boto3/SDK shape) so templates following the AWS docs silently fell back
+    to an auto-generated stack-LogicalId-suffix name."""
+    requested_name = "cfn-upn-honored-pool"
+    template = {
+        "AWSTemplateFormatVersion": "2010-09-09",
+        "Resources": {
+            "Pool": {
+                "Type": "AWS::Cognito::UserPool",
+                "Properties": {"UserPoolName": requested_name},
+            },
+        },
+        "Outputs": {"PoolId": {"Value": {"Ref": "Pool"}}},
+    }
+    stack_name = "cfn-upn-honored"
+    try:
+        cfn.delete_stack(StackName=stack_name)
+    except Exception:
+        pass
+    cfn.create_stack(StackName=stack_name, TemplateBody=json.dumps(template))
+    _wait_stack(cfn, stack_name)
+
+    stack = cfn.describe_stacks(StackName=stack_name)["Stacks"][0]
+    pool_id = {o["OutputKey"]: o["OutputValue"] for o in stack.get("Outputs", [])}["PoolId"]
+    described = cognito_idp.describe_user_pool(UserPoolId=pool_id)["UserPool"]
+    assert described["Name"] == requested_name, (
+        f"UserPoolName should be honored verbatim; got {described['Name']!r}"
+    )
+
+    cfn.delete_stack(StackName=stack_name)
+    _wait_stack(cfn, stack_name)
+
+
+def test_cfn_cognito_identity_pool_update_in_place_preserves_id(cfn, cognito_identity):
+    """Regression: stack updates that change AWS::Cognito::IdentityPool
+    properties must mutate the existing pool in place rather than minting a
+    new one. Pre-fix the engine fell back to ``_cognito_identity_pool_create``
+    (no update handler), orphaning the previous pool and presenting two
+    identically-named pools to client SDKs."""
+    def _tpl(name: str, allow_unauth: bool):
+        return {
+            "AWSTemplateFormatVersion": "2010-09-09",
+            "Resources": {
+                "IdPool": {
+                    "Type": "AWS::Cognito::IdentityPool",
+                    "Properties": {
+                        "IdentityPoolName": name,
+                        "AllowUnauthenticatedIdentities": allow_unauth,
+                    },
+                },
+            },
+            "Outputs": {"IdPoolId": {"Value": {"Ref": "IdPool"}}},
+        }
+
+    stack_name = "cfn-idpool-upd-t01"
+    try:
+        cfn.delete_stack(StackName=stack_name)
+    except Exception:
+        pass
+    cfn.create_stack(StackName=stack_name, TemplateBody=json.dumps(_tpl("idp-v1", False)))
+    _wait_stack(cfn, stack_name)
+    stack = cfn.describe_stacks(StackName=stack_name)["Stacks"][0]
+    initial_id = {o["OutputKey"]: o["OutputValue"] for o in stack["Outputs"]}["IdPoolId"]
+    described = cognito_identity.describe_identity_pool(IdentityPoolId=initial_id)
+    assert described["IdentityPoolName"] == "idp-v1"
+    assert described["AllowUnauthenticatedIdentities"] is False
+
+    cfn.update_stack(StackName=stack_name, TemplateBody=json.dumps(_tpl("idp-v2", True)))
+    _wait_stack(cfn, stack_name)
+    stack = cfn.describe_stacks(StackName=stack_name)["Stacks"][0]
+    current_id = {o["OutputKey"]: o["OutputValue"] for o in stack["Outputs"]}["IdPoolId"]
+    assert current_id == initial_id, (
+        f"IdentityPoolId changed across update ({initial_id} → {current_id})"
+    )
+    described = cognito_identity.describe_identity_pool(IdentityPoolId=current_id)
+    assert described["IdentityPoolName"] == "idp-v2"
+    assert described["AllowUnauthenticatedIdentities"] is True
+
+    # No duplicate of this stack's pool by name — pre-fix, the old pool
+    # lingered alongside the new one.
+    pools = cognito_identity.list_identity_pools(MaxResults=60)["IdentityPools"]
+    matches = [p for p in pools if p["IdentityPoolName"] in ("idp-v1", "idp-v2")]
+    assert len(matches) == 1 and matches[0]["IdentityPoolId"] == initial_id, (
+        f"expected exactly one pool matching the stack's name history, got {matches}"
+    )
+
+    cfn.delete_stack(StackName=stack_name)
+    _wait_stack(cfn, stack_name)
+
+
 # ---------------------------------------------------------------------------
 # ApiGatewayV2 Integration + Route provisioners
 # ---------------------------------------------------------------------------
@@ -2598,6 +2690,81 @@ def test_cfn_apigwv2_api_update_in_place_preserves_id_and_state(cfn, apigw):
     assert len(matches) == 1 and matches[0]["ApiId"] == initial_api_id, (
         f"expected exactly one Api matching the stack's name history, got {matches}"
     )
+
+    cfn.delete_stack(StackName=stack_name)
+    _wait_stack(cfn, stack_name)
+
+
+def test_cfn_apigwv2_authorizer_create_and_update_in_place(cfn, apigw):
+    """Regression: AWS::ApiGatewayV2::Authorizer was an unregistered resource
+    type, so any CDK HttpApi using HttpUserPoolAuthorizer / HttpJwtAuthorizer
+    silently produced no authorizer at all — routes ended up unauthenticated.
+    This test exercises both the create wiring and the in-place update path
+    so redeploys don't accumulate duplicates."""
+    def _tpl(name: str, ttl: int):
+        return {
+            "AWSTemplateFormatVersion": "2010-09-09",
+            "Resources": {
+                "HttpApi": {
+                    "Type": "AWS::ApiGatewayV2::Api",
+                    "Properties": {"Name": "cfn-apigwv2-auth-t01", "ProtocolType": "HTTP"},
+                },
+                "Authorizer": {
+                    "Type": "AWS::ApiGatewayV2::Authorizer",
+                    "Properties": {
+                        "ApiId": {"Ref": "HttpApi"},
+                        "Name": name,
+                        "AuthorizerType": "JWT",
+                        "IdentitySource": ["$request.header.Authorization"],
+                        "JwtConfiguration": {
+                            "Audience": ["aud-1"],
+                            "Issuer": "https://issuer.example/",
+                        },
+                        "AuthorizerResultTtlInSeconds": ttl,
+                    },
+                },
+            },
+            "Outputs": {
+                "AuthorizerId": {"Value": {"Ref": "Authorizer"}},
+                "ApiId": {"Value": {"Ref": "HttpApi"}},
+            },
+        }
+
+    stack_name = "cfn-apigwv2-auth-t01"
+    try:
+        cfn.delete_stack(StackName=stack_name)
+    except Exception:
+        pass
+    cfn.create_stack(StackName=stack_name, TemplateBody=json.dumps(_tpl("auth-v1", 300)))
+    _wait_stack(cfn, stack_name)
+    stack = cfn.describe_stacks(StackName=stack_name)["Stacks"][0]
+    outputs = {o["OutputKey"]: o["OutputValue"] for o in stack["Outputs"]}
+    api_id = outputs["ApiId"]
+    initial_auth_id = outputs["AuthorizerId"]
+
+    authorizers = apigw.get_authorizers(ApiId=api_id)["Items"]
+    assert len(authorizers) == 1
+    assert authorizers[0]["AuthorizerId"] == initial_auth_id
+    assert authorizers[0]["Name"] == "auth-v1"
+    assert authorizers[0]["AuthorizerResultTtlInSeconds"] == 300
+    assert authorizers[0]["JwtConfiguration"]["Audience"] == ["aud-1"]
+
+    # Property change must mutate the existing authorizer in place — pre-fix
+    # this would mint a fresh AuthorizerId and leave the old one behind.
+    cfn.update_stack(StackName=stack_name, TemplateBody=json.dumps(_tpl("auth-v2", 600)))
+    _wait_stack(cfn, stack_name)
+    stack = cfn.describe_stacks(StackName=stack_name)["Stacks"][0]
+    current_auth_id = {o["OutputKey"]: o["OutputValue"] for o in stack["Outputs"]}["AuthorizerId"]
+    assert current_auth_id == initial_auth_id, (
+        f"AuthorizerId changed across update ({initial_auth_id} → {current_auth_id})"
+    )
+
+    authorizers = apigw.get_authorizers(ApiId=api_id)["Items"]
+    assert len(authorizers) == 1, (
+        f"expected 1 authorizer after update, got {len(authorizers)}: {authorizers}"
+    )
+    assert authorizers[0]["Name"] == "auth-v2"
+    assert authorizers[0]["AuthorizerResultTtlInSeconds"] == 600
 
     cfn.delete_stack(StackName=stack_name)
     _wait_stack(cfn, stack_name)

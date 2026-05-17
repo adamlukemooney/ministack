@@ -572,6 +572,91 @@ def test_sqs_event_source_mapping_to_lambda(lam, sqs):
     lam.delete_event_source_mapping(UUID=esm["UUID"])
 
 
+def test_sqs_event_source_mapping_camelcase_message_attributes(lam, sqs, logs):
+    """Regression: SQS event source mapping must deliver messageAttributes in
+    the camelCase shape Lambda receives in real AWS ({stringValue, dataType,
+    ...}), not the SDK PascalCase shape ({StringValue, DataType, ...}).
+    Pre-fix handlers reading record['messageAttributes']['x']['stringValue']
+    got a KeyError under ministack but worked in production."""
+    queue_name = f"intg-sqsesm-attrs-{_uuid_mod.uuid4().hex[:8]}"
+    fn_name = f"intg-sqsesm-attrs-fn-{_uuid_mod.uuid4().hex[:8]}"
+
+    queue_url = sqs.create_queue(QueueName=queue_name)["QueueUrl"]
+    queue_arn = sqs.get_queue_attributes(
+        QueueUrl=queue_url, AttributeNames=["QueueArn"]
+    )["Attributes"]["QueueArn"]
+
+    code = (
+        "import json\n"
+        "def handler(event, context):\n"
+        "    for rec in event.get('Records', []):\n"
+        "        attrs = rec.get('messageAttributes', {})\n"
+        "        for name, val in attrs.items():\n"
+        "            print('ATTR ' + name + ' ' + json.dumps(val))\n"
+        "    return {'ok': True}\n"
+    )
+    lam.create_function(
+        FunctionName=fn_name,
+        Runtime="python3.11",
+        Role=_LAMBDA_ROLE,
+        Handler="index.handler",
+        Code={"ZipFile": _make_zip(code)},
+    )
+
+    esm = lam.create_event_source_mapping(
+        FunctionName=fn_name,
+        EventSourceArn=queue_arn,
+        BatchSize=1,
+    )
+
+    sqs.send_message(
+        QueueUrl=queue_url,
+        MessageBody="probe",
+        MessageAttributes={
+            "color": {"DataType": "String", "StringValue": "blue"},
+            "count": {"DataType": "Number", "StringValue": "42"},
+        },
+    )
+
+    log_group = f"/aws/lambda/{fn_name}"
+    attr_lines: list[str] = []
+    for _ in range(15):
+        time.sleep(1)
+        try:
+            streams = logs.describe_log_streams(logGroupName=log_group)["logStreams"]
+        except ClientError:
+            continue
+        for stream in streams:
+            events = logs.get_log_events(
+                logGroupName=log_group, logStreamName=stream["logStreamName"],
+            )["events"]
+            attr_lines.extend(e["message"] for e in events if "ATTR " in e["message"])
+        if attr_lines:
+            break
+
+    try:
+        assert attr_lines, f"Lambda never logged any ATTR lines (group={log_group})"
+        joined = "\n".join(attr_lines)
+        # Real AWS delivers camelCase keys; the bug was passing through PascalCase.
+        assert "stringValue" in joined and "dataType" in joined, (
+            f"messageAttributes inner keys should be camelCase: {joined}"
+        )
+        assert "StringValue" not in joined and "DataType" not in joined, (
+            f"messageAttributes should not retain PascalCase SDK shape: {joined}"
+        )
+        assert '"blue"' in joined and '"42"' in joined
+    finally:
+        lam.delete_event_source_mapping(UUID=esm["UUID"])
+        try:
+            lam.delete_function(FunctionName=fn_name)
+        except ClientError:
+            pass
+        try:
+            sqs.delete_queue(QueueUrl=queue_url)
+        except ClientError:
+            pass
+
+
 def test_sqs_bare_queue_name_as_url(sqs):
     """Passing a bare queue name instead of a full URL should work (AWS compatibility)."""
     queue_name = "intg-sqs-bare-name"

@@ -349,6 +349,67 @@ def test_apigw_execute_lambda_proxy(apigw, lam):
     apigw.delete_api(ApiId=api_id)
     lam.delete_function(FunctionName=fname)
 
+
+def test_apigw_execute_lambda_isbase64encoded_response(apigw, lam):
+    """Handlers returning isBase64Encoded=True should have their body
+    base64-decoded into raw bytes on the wire — same as real API Gateway.
+    Pre-fix the body was utf-8-encoded verbatim, so binary responses arrived
+    as literal base64 strings to the client."""
+    import urllib.request as _urlreq
+    import uuid as _uuid
+
+    fname = f"intg-apigw-b64-{_uuid.uuid4().hex[:8]}"
+    raw_payload = b"\x89PNG\r\n\x1a\n\x00\x01\x02binary-bytes"
+    encoded = base64.b64encode(raw_payload).decode("ascii")
+    code = (
+        "def handler(event, context):\n"
+        "    return {\n"
+        "        'statusCode': 200,\n"
+        "        'headers': {'Content-Type': 'image/png'},\n"
+        f"        'body': '{encoded}',\n"
+        "        'isBase64Encoded': True,\n"
+        "    }\n"
+    )
+    lam.create_function(
+        FunctionName=fname,
+        Runtime="python3.12",
+        Role="arn:aws:iam::000000000000:role/test-role",
+        Handler="index.handler",
+        Code={"ZipFile": _make_zip(code)},
+    )
+
+    api_id = apigw.create_api(Name=f"exec-b64-{fname}", ProtocolType="HTTP")["ApiId"]
+    int_id = apigw.create_integration(
+        ApiId=api_id,
+        IntegrationType="AWS_PROXY",
+        IntegrationUri=f"arn:aws:lambda:us-east-1:000000000000:function:{fname}",
+        PayloadFormatVersion="2.0",
+    )["IntegrationId"]
+    route_id = apigw.create_route(
+        ApiId=api_id,
+        RouteKey="GET /image",
+        Target=f"integrations/{int_id}",
+    )["RouteId"]
+    apigw.create_stage(ApiId=api_id, StageName="$default")
+
+    from tests.conftest import patch_endpoint_dns
+    url = f"http://{api_id}.execute-api.localhost:{_EXECUTE_PORT}/$default/image"
+    req = _urlreq.Request(url, method="GET")
+    req.add_header("Host", f"{api_id}.execute-api.localhost:{_EXECUTE_PORT}")
+    with patch_endpoint_dns():
+        resp = _urlreq.urlopen(req)
+    assert resp.status == 200
+    assert resp.read() == raw_payload, (
+        "isBase64Encoded=True response should be delivered as raw bytes, "
+        "not the literal base64 string"
+    )
+
+    apigw.delete_route(ApiId=api_id, RouteId=route_id)
+    apigw.delete_integration(ApiId=api_id, IntegrationId=int_id)
+    apigw.delete_api(ApiId=api_id)
+    lam.delete_function(FunctionName=fname)
+
+
 def test_apigw_execute_no_route(apigw):
     """execute-api returns 404 when no matching route exists."""
     import urllib.error as _urlerr
