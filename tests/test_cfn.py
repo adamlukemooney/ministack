@@ -2874,6 +2874,77 @@ def test_cfn_apigwv2_api_update_in_place_preserves_id_and_state(cfn, apigw):
     _wait_stack(cfn, stack_name)
 
 
+def test_cfn_apigwv2_api_update_preserves_cors_configuration(cfn, apigw):
+    """Regression: an in-place ApiGatewayV2::Api update that doesn't itself
+    touch ``CorsConfiguration`` must not blank out the existing CORS config.
+    Pre-fix the create + update handlers stored the CFN-shape (PascalCase
+    inner keys: AllowOrigins, AllowMethods, …) verbatim, but the boto3
+    response model for ``corsConfiguration`` expects camelCase
+    (allowOrigins, allowMethods, …) — so ``get-api`` after deploy returned
+    an empty CORS block even though the data was technically still there,
+    and every browser preflight failed with no CORS headers until a manual
+    ``apigatewayv2 update-api --cors-configuration ...`` re-applied it.
+
+    The fix normalises the inner keys to camelCase on store so the
+    SDK round-trip stays accurate across CREATE and UPDATE.
+    """
+    def _tpl(name: str, description: str | None = None):
+        props: dict = {
+            "Name": name,
+            "ProtocolType": "HTTP",
+            "CorsConfiguration": {
+                "AllowOrigins": ["https://example.com"],
+                "AllowMethods": ["GET", "POST", "OPTIONS"],
+                "AllowHeaders": ["authorization", "content-type"],
+                "AllowCredentials": True,
+                "ExposeHeaders": ["x-request-id"],
+                "MaxAge": 600,
+            },
+        }
+        if description is not None:
+            props["Description"] = description
+        return {
+            "AWSTemplateFormatVersion": "2010-09-09",
+            "Resources": {"HttpApi": {"Type": "AWS::ApiGatewayV2::Api", "Properties": props}},
+            "Outputs": {"ApiId": {"Value": {"Ref": "HttpApi"}}},
+        }
+
+    stack_name = "cfn-apigwv2-cors-t01"
+    try:
+        cfn.delete_stack(StackName=stack_name)
+    except Exception:
+        pass
+    cfn.create_stack(StackName=stack_name, TemplateBody=json.dumps(_tpl("cors-api-v1")))
+    _wait_stack(cfn, stack_name)
+    stack = cfn.describe_stacks(StackName=stack_name)["Stacks"][0]
+    api_id = {o["OutputKey"]: o["OutputValue"] for o in stack["Outputs"]}["ApiId"]
+
+    initial = apigw.get_api(ApiId=api_id).get("CorsConfiguration") or {}
+    assert sorted(initial.get("AllowOrigins") or []) == ["https://example.com"]
+    assert sorted(initial.get("AllowMethods") or []) == ["GET", "OPTIONS", "POST"]
+    assert initial.get("AllowCredentials") is True
+    assert initial.get("MaxAge") == 600
+
+    # Touch a different property to trigger UPDATE without altering CORS.
+    cfn.update_stack(
+        StackName=stack_name,
+        TemplateBody=json.dumps(_tpl("cors-api-v1", description="bump for update")),
+    )
+    _wait_stack(cfn, stack_name)
+    after = apigw.get_api(ApiId=api_id).get("CorsConfiguration") or {}
+    assert sorted(after.get("AllowOrigins") or []) == ["https://example.com"], (
+        f"CORS allowOrigins blanked by UPDATE: {after}"
+    )
+    assert sorted(after.get("AllowMethods") or []) == ["GET", "OPTIONS", "POST"], (
+        f"CORS allowMethods blanked by UPDATE: {after}"
+    )
+    assert after.get("AllowCredentials") is True
+    assert after.get("MaxAge") == 600
+
+    cfn.delete_stack(StackName=stack_name)
+    _wait_stack(cfn, stack_name)
+
+
 def test_cfn_apigwv2_authorizer_create_and_update_in_place(cfn, apigw):
     """Regression: AWS::ApiGatewayV2::Authorizer was an unregistered resource
     type, so any CDK HttpApi using HttpUserPoolAuthorizer / HttpJwtAuthorizer
@@ -2944,6 +3015,136 @@ def test_cfn_apigwv2_authorizer_create_and_update_in_place(cfn, apigw):
     )
     assert authorizers[0]["Name"] == "auth-v2"
     assert authorizers[0]["AuthorizerResultTtlInSeconds"] == 600
+
+    cfn.delete_stack(StackName=stack_name)
+    _wait_stack(cfn, stack_name)
+
+
+def test_cfn_apigwv2_route_propagates_authorizer_id(cfn, apigw):
+    """Regression: ``AWS::ApiGatewayV2::Route`` must read ``AuthorizerId``
+    (and ``AuthorizationScopes``) from CFN properties and pass them through
+    to the underlying route record. Pre-fix CFN created routes with
+    ``AuthorizationType=CUSTOM`` but no ``AuthorizerId`` set — the route was
+    left in a half-configured state that returns HTTP 500 on invocation
+    because the runtime can't find the authorizer to validate against, even
+    though the corresponding ``AWS::ApiGatewayV2::Authorizer`` resource was
+    correctly provisioned alongside it.
+
+    Covers both the CREATE path (initial deploy) and the UPDATE path
+    (switching AuthorizerId between two authorizers, then clearing it back
+    to ``AuthorizationType=NONE``).
+    """
+    def _tpl(auth_logical_id: str | None, scopes: list | None = None,
+             auth_type: str = "CUSTOM"):
+        resources: dict = {
+            "HttpApi": {
+                "Type": "AWS::ApiGatewayV2::Api",
+                "Properties": {"Name": "cfn-apigwv2-routeauth-t01", "ProtocolType": "HTTP"},
+            },
+            "Integration": {
+                "Type": "AWS::ApiGatewayV2::Integration",
+                "Properties": {
+                    "ApiId": {"Ref": "HttpApi"},
+                    "IntegrationType": "AWS_PROXY",
+                    "IntegrationUri": "arn:aws:lambda:us-east-1:000000000000:function:dummy",
+                    "PayloadFormatVersion": "2.0",
+                },
+            },
+            "AuthorizerA": {
+                "Type": "AWS::ApiGatewayV2::Authorizer",
+                "Properties": {
+                    "ApiId": {"Ref": "HttpApi"},
+                    "Name": "auth-a",
+                    "AuthorizerType": "JWT",
+                    "IdentitySource": ["$request.header.Authorization"],
+                    "JwtConfiguration": {"Audience": ["aud-a"], "Issuer": "https://issuer-a/"},
+                },
+            },
+            "AuthorizerB": {
+                "Type": "AWS::ApiGatewayV2::Authorizer",
+                "Properties": {
+                    "ApiId": {"Ref": "HttpApi"},
+                    "Name": "auth-b",
+                    "AuthorizerType": "JWT",
+                    "IdentitySource": ["$request.header.Authorization"],
+                    "JwtConfiguration": {"Audience": ["aud-b"], "Issuer": "https://issuer-b/"},
+                },
+            },
+        }
+        route_props: dict = {
+            "ApiId": {"Ref": "HttpApi"},
+            "RouteKey": "GET /things",
+            "Target": {"Fn::Join": ["/", ["integrations", {"Ref": "Integration"}]]},
+            "AuthorizationType": auth_type,
+        }
+        if auth_logical_id is not None:
+            route_props["AuthorizerId"] = {"Ref": auth_logical_id}
+        if scopes is not None:
+            route_props["AuthorizationScopes"] = scopes
+        resources["Route"] = {"Type": "AWS::ApiGatewayV2::Route", "Properties": route_props}
+        return {
+            "AWSTemplateFormatVersion": "2010-09-09",
+            "Resources": resources,
+            "Outputs": {
+                "ApiId": {"Value": {"Ref": "HttpApi"}},
+                "RouteId": {"Value": {"Ref": "Route"}},
+                "AuthorizerAId": {"Value": {"Ref": "AuthorizerA"}},
+                "AuthorizerBId": {"Value": {"Ref": "AuthorizerB"}},
+            },
+        }
+
+    stack_name = "cfn-apigwv2-routeauth-t01"
+    try:
+        cfn.delete_stack(StackName=stack_name)
+    except Exception:
+        pass
+    cfn.create_stack(
+        StackName=stack_name,
+        TemplateBody=json.dumps(_tpl("AuthorizerA", scopes=["read:things"])),
+    )
+    _wait_stack(cfn, stack_name)
+    stack = cfn.describe_stacks(StackName=stack_name)["Stacks"][0]
+    outputs = {o["OutputKey"]: o["OutputValue"] for o in stack["Outputs"]}
+    api_id = outputs["ApiId"]
+    initial_route_id = outputs["RouteId"].split("/", 1)[1]
+    auth_a_id = outputs["AuthorizerAId"]
+    auth_b_id = outputs["AuthorizerBId"]
+
+    route = apigw.get_route(ApiId=api_id, RouteId=initial_route_id)
+    assert route.get("AuthorizationType") == "CUSTOM", route
+    assert route.get("AuthorizerId") == auth_a_id, (
+        f"CREATE must propagate AuthorizerId; got {route}"
+    )
+    assert route.get("AuthorizationScopes") == ["read:things"]
+
+    # UPDATE: swap to the other authorizer and change scopes.
+    cfn.update_stack(
+        StackName=stack_name,
+        TemplateBody=json.dumps(_tpl("AuthorizerB", scopes=["write:things"])),
+    )
+    _wait_stack(cfn, stack_name)
+    route = apigw.get_route(ApiId=api_id, RouteId=initial_route_id)
+    assert route.get("AuthorizerId") == auth_b_id, (
+        f"UPDATE must repoint AuthorizerId; got {route}"
+    )
+    assert route.get("AuthorizationScopes") == ["write:things"]
+
+    # UPDATE: remove the authorizer entirely (drop to NONE) — the runtime
+    # treats lingering AuthorizerId fields against AuthorizationType=NONE
+    # as a half-configured route, so the field must be cleared.
+    cfn.update_stack(
+        StackName=stack_name,
+        TemplateBody=json.dumps(_tpl(None, auth_type="NONE")),
+    )
+    _wait_stack(cfn, stack_name)
+    route = apigw.get_route(ApiId=api_id, RouteId=initial_route_id)
+    assert route.get("AuthorizationType") == "NONE"
+    assert not route.get("AuthorizerId"), (
+        f"clearing AuthorizationType to NONE must drop AuthorizerId; got {route}"
+    )
+    assert not route.get("AuthorizationScopes"), (
+        f"clearing AuthorizationType to NONE must drop AuthorizationScopes; got {route}"
+    )
 
     cfn.delete_stack(StackName=stack_name)
     _wait_stack(cfn, stack_name)
