@@ -1708,6 +1708,41 @@ def _cognito_identity_pool_create(logical_id, props, stack_name):
     return iid, {}
 
 
+def _cognito_identity_pool_update(physical_id, old_props, new_props, stack_name):
+    """In-place update of a Cognito Identity Pool.
+
+    Without this, every stack redeploy fires ``_cognito_identity_pool_create``
+    — which mints a fresh identity pool id — orphaning the previous pool in
+    memory and producing duplicate-named pools that confuse client SDKs. Real
+    CFN preserves the Ref-able physical ID across updates for mutable
+    properties.
+
+    Falls back to a fresh create if the previous physical_id can't be located.
+    """
+    pool = _cognito._identity_pools.get(physical_id)
+    if pool is None:
+        return _cognito_identity_pool_create(physical_id, new_props, stack_name)
+    if "IdentityPoolName" in new_props:
+        pool["IdentityPoolName"] = new_props["IdentityPoolName"]
+    if "AllowUnauthenticatedIdentities" in new_props:
+        pool["AllowUnauthenticatedIdentities"] = new_props["AllowUnauthenticatedIdentities"]
+    if "AllowClassicFlow" in new_props:
+        pool["AllowClassicFlow"] = new_props["AllowClassicFlow"]
+    if "SupportedLoginProviders" in new_props:
+        pool["SupportedLoginProviders"] = new_props["SupportedLoginProviders"]
+    if "DeveloperProviderName" in new_props:
+        pool["DeveloperProviderName"] = new_props["DeveloperProviderName"]
+    if "OpenIdConnectProviderARNs" in new_props:
+        pool["OpenIdConnectProviderARNs"] = new_props["OpenIdConnectProviderARNs"]
+    if "CognitoIdentityProviders" in new_props:
+        pool["CognitoIdentityProviders"] = new_props["CognitoIdentityProviders"]
+    if "SamlProviderARNs" in new_props:
+        pool["SamlProviderARNs"] = new_props["SamlProviderARNs"]
+    if "IdentityPoolTags" in new_props:
+        pool["IdentityPoolTags"] = new_props["IdentityPoolTags"]
+    return physical_id, {}
+
+
 def _cognito_identity_pool_delete(physical_id, props):
     _cognito._identity_pools.pop(physical_id, None)
     _cognito._identity_tags.pop(physical_id, None)
@@ -3731,7 +3766,7 @@ _RESOURCE_HANDLERS = {
     "AWS::SecretsManager::Secret": {"create": _sm_secret_create, "delete": _sm_secret_delete},
     "AWS::Cognito::UserPool": {"create": _cognito_user_pool_create, "delete": _cognito_user_pool_delete},
     "AWS::Cognito::UserPoolClient": {"create": _cognito_user_pool_client_create, "delete": _cognito_user_pool_client_delete},
-    "AWS::Cognito::IdentityPool": {"create": _cognito_identity_pool_create, "delete": _cognito_identity_pool_delete},
+    "AWS::Cognito::IdentityPool": {"create": _cognito_identity_pool_create, "update": _cognito_identity_pool_update, "delete": _cognito_identity_pool_delete},
     "AWS::Cognito::UserPoolDomain": {"create": _cognito_user_pool_domain_create, "delete": _cognito_user_pool_domain_delete},
     "AWS::ECR::Repository": {"create": _ecr_repo_create, "delete": _ecr_repo_delete},
     "AWS::CertificateManager::Certificate": {"create": _acm_certificate_create, "delete": _acm_certificate_delete},
