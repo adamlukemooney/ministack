@@ -3034,6 +3034,48 @@ def _apigw_v2_integration_create(logical_id, props, stack_name):
     return int_id, {"IntegrationId": int_id, "ApiId": api_id}
 
 
+def _apigw_v2_integration_update(physical_id, old_props, new_props, stack_name):
+    """In-place update of an ApiGatewayV2 Integration.
+
+    Without this, the engine's update-falls-back-to-create path runs
+    ``_apigw_v2_integration_create`` again, which mints a fresh ``IntegrationId``
+    and leaves the old integration row behind — so each stack redeploy
+    accumulates a duplicate integration. Falls back to a fresh create only when
+    the previous physical_id can't be located (e.g., state reset between
+    deploys, or parent Api replaced).
+    """
+    api_id = old_props.get("ApiId") or new_props.get("ApiId", "")
+    int_id = physical_id
+    # Backwards compat: pre-#x physical IDs were "{apiId}/{intId}".
+    if "/" in physical_id:
+        api_id, int_id = physical_id.split("/", 1)
+    existing = _apigw_v2._integrations.get(api_id, {}).get(int_id) if api_id else None
+    if existing is None:
+        return _apigw_v2_integration_create(physical_id, new_props, stack_name)
+    new_api_id = new_props.get("ApiId", api_id)
+    if new_api_id != api_id:
+        _apigw_v2._integrations.get(api_id, {}).pop(int_id, None)
+        _apigw_v2._integrations.setdefault(new_api_id, {})[int_id] = existing
+        api_id = new_api_id
+    for prop_key, field in (
+        ("IntegrationType", "integrationType"),
+        ("IntegrationUri", "integrationUri"),
+        ("IntegrationMethod", "integrationMethod"),
+        ("PayloadFormatVersion", "payloadFormatVersion"),
+        ("TimeoutInMillis", "timeoutInMillis"),
+        ("ConnectionType", "connectionType"),
+        ("ConnectionId", "connectionId"),
+        ("Description", "description"),
+        ("RequestParameters", "requestParameters"),
+        ("RequestTemplates", "requestTemplates"),
+        ("ResponseParameters", "responseParameters"),
+        ("ContentHandlingStrategy", "contentHandlingStrategy"),
+    ):
+        if prop_key in new_props:
+            existing[field] = new_props[prop_key]
+    return int_id, {"IntegrationId": int_id, "ApiId": api_id}
+
+
 def _apigw_v2_integration_delete(physical_id, props):
     api_id = props.get("ApiId", "")
     int_id = physical_id
@@ -3065,6 +3107,41 @@ def _apigw_v2_route_create(logical_id, props, stack_name):
     }
     _apigw_v2._routes.setdefault(api_id, {})[route_id] = route
     physical_id = f"{api_id}/{route_id}"
+    return physical_id, {"RouteId": route_id}
+
+
+def _apigw_v2_route_update(physical_id, old_props, new_props, stack_name):
+    """In-place update of an ApiGatewayV2 Route.
+
+    Without this, stack redeploys accumulate duplicate routes: the engine
+    falls back to ``_apigw_v2_route_create`` which mints a fresh ``RouteId``
+    and leaves the previous route entry in place, so by the second redeploy
+    every RouteKey has two entries pointing at two different integrations.
+    Falls back to a fresh create only when the previous physical_id can't
+    be located.
+    """
+    parts = physical_id.split("/", 1)
+    if len(parts) != 2:
+        return _apigw_v2_route_create(physical_id, new_props, stack_name)
+    api_id, route_id = parts
+    existing = _apigw_v2._routes.get(api_id, {}).get(route_id)
+    if existing is None:
+        return _apigw_v2_route_create(physical_id, new_props, stack_name)
+    new_api_id = new_props.get("ApiId", api_id)
+    if new_api_id != api_id:
+        _apigw_v2._routes.get(api_id, {}).pop(route_id, None)
+        _apigw_v2._routes.setdefault(new_api_id, {})[route_id] = existing
+        api_id = new_api_id
+        physical_id = f"{api_id}/{route_id}"
+    existing["routeKey"] = new_props.get("RouteKey", existing.get("routeKey", "$default"))
+    existing["target"] = new_props.get("Target", existing.get("target", ""))
+    existing["authorizationType"] = new_props.get("AuthorizationType", existing.get("authorizationType", "NONE"))
+    existing["apiKeyRequired"] = new_props.get("ApiKeyRequired", existing.get("apiKeyRequired", False))
+    existing["operationName"] = new_props.get("OperationName", existing.get("operationName", ""))
+    if "RequestModels" in new_props:
+        existing["requestModels"] = new_props["RequestModels"]
+    if "RequestParameters" in new_props:
+        existing["requestParameters"] = new_props["RequestParameters"]
     return physical_id, {"RouteId": route_id}
 
 
@@ -3644,8 +3721,8 @@ _RESOURCE_HANDLERS = {
     "AWS::Route53::RecordSet": {"create": _r53_record_set_create, "delete": _r53_record_set_delete},
     "AWS::ApiGatewayV2::Api": {"create": _apigw_v2_api_create, "delete": _apigw_v2_api_delete},
     "AWS::ApiGatewayV2::Stage": {"create": _apigw_v2_stage_create, "delete": _apigw_v2_stage_delete},
-    "AWS::ApiGatewayV2::Integration": {"create": _apigw_v2_integration_create, "delete": _apigw_v2_integration_delete},
-    "AWS::ApiGatewayV2::Route": {"create": _apigw_v2_route_create, "delete": _apigw_v2_route_delete},
+    "AWS::ApiGatewayV2::Integration": {"create": _apigw_v2_integration_create, "update": _apigw_v2_integration_update, "delete": _apigw_v2_integration_delete},
+    "AWS::ApiGatewayV2::Route": {"create": _apigw_v2_route_create, "update": _apigw_v2_route_update, "delete": _apigw_v2_route_delete},
     "AWS::SES::EmailIdentity": {"create": _ses_email_identity_create, "delete": _ses_email_identity_delete},
     "AWS::WAFv2::WebACL": {"create": _waf_web_acl_create, "delete": _waf_web_acl_delete},
     "AWS::CloudFront::Distribution": {"create": _cf_distribution_create, "delete": _cf_distribution_delete},

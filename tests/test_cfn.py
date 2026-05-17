@@ -2470,6 +2470,91 @@ def test_cfn_apigwv2_route_basic(cfn, apigw):
     assert apigw.get_routes(ApiId=api_id)["Items"] == []
 
 
+def test_cfn_apigwv2_route_update_in_place_no_duplicates(cfn, apigw):
+    """Regression: stack updates must mutate the existing ApiGatewayV2 Route
+    in place rather than minting a fresh one. Pre-fix the engine fell back to
+    ``_apigw_v2_route_create`` (no update handler), accumulating duplicate
+    routes on every redeploy."""
+    def _tpl(route_key: str):
+        return {
+            "AWSTemplateFormatVersion": "2010-09-09",
+            "Resources": {
+                "HttpApi": {
+                    "Type": "AWS::ApiGatewayV2::Api",
+                    "Properties": {"Name": "cfn-apigwv2-dup-t01", "ProtocolType": "HTTP"},
+                },
+                "Integration": {
+                    "Type": "AWS::ApiGatewayV2::Integration",
+                    "Properties": {
+                        "ApiId": {"Ref": "HttpApi"},
+                        "IntegrationType": "AWS_PROXY",
+                        "IntegrationUri": "arn:aws:lambda:us-east-1:000000000000:function:dummy",
+                        "PayloadFormatVersion": "2.0",
+                    },
+                },
+                "Route": {
+                    "Type": "AWS::ApiGatewayV2::Route",
+                    "Properties": {
+                        "ApiId": {"Ref": "HttpApi"},
+                        "RouteKey": route_key,
+                        "Target": {"Fn::Join": ["/", ["integrations", {"Ref": "Integration"}]]},
+                    },
+                },
+            },
+        }
+
+    stack_name = "cfn-apigwv2-dup-t01"
+    cfn.create_stack(StackName=stack_name, TemplateBody=json.dumps(_tpl("GET /v1")))
+    stack = _wait_stack(cfn, stack_name)
+    assert stack["StackStatus"] == "CREATE_COMPLETE"
+
+    resources = cfn.describe_stack_resources(StackName=stack_name)["StackResources"]
+    initial_route_id = next(r["PhysicalResourceId"].split("/", 1)[1] for r in resources
+                            if r["ResourceType"] == "AWS::ApiGatewayV2::Route")
+    initial_int_id = next(r["PhysicalResourceId"] for r in resources
+                          if r["ResourceType"] == "AWS::ApiGatewayV2::Integration")
+
+    # Redeploy with a different RouteKey — exact scenario where the old code
+    # left a duplicate behind. The parent Api may itself be replaced (separate
+    # known quirk for ``AWS::ApiGatewayV2::Api`` non-idempotency); the Route +
+    # Integration update handlers move the in-place record under whichever Api
+    # the current stack references.
+    cfn.update_stack(StackName=stack_name, TemplateBody=json.dumps(_tpl("GET /v2")))
+    stack = _wait_stack(cfn, stack_name)
+    assert stack["StackStatus"] == "UPDATE_COMPLETE"
+
+    resources_after = cfn.describe_stack_resources(StackName=stack_name)["StackResources"]
+    current_api_id = next(r["PhysicalResourceId"] for r in resources_after
+                          if r["ResourceType"] == "AWS::ApiGatewayV2::Api")
+
+    routes = apigw.get_routes(ApiId=current_api_id)["Items"]
+    assert len(routes) == 1, f"expected 1 route after update, got {len(routes)}: {routes}"
+    assert routes[0]["RouteKey"] == "GET /v2"
+    assert routes[0]["RouteId"] == initial_route_id, (
+        f"RouteId changed across update ({initial_route_id} → {routes[0]['RouteId']}); "
+        "in-place update should preserve the route's physical ID"
+    )
+
+    integrations = apigw.get_integrations(ApiId=current_api_id)["Items"]
+    assert len(integrations) == 1, (
+        f"expected 1 integration after update, got {len(integrations)}: {integrations}"
+    )
+    assert integrations[0]["IntegrationId"] == initial_int_id
+
+    # A second redeploy of the same template should still leave exactly one
+    # of each — proves the update handler is idempotent across repeated calls.
+    cfn.update_stack(StackName=stack_name, TemplateBody=json.dumps(_tpl("GET /v2")))
+    _wait_stack(cfn, stack_name)
+    resources_again = cfn.describe_stack_resources(StackName=stack_name)["StackResources"]
+    current_api_id = next(r["PhysicalResourceId"] for r in resources_again
+                          if r["ResourceType"] == "AWS::ApiGatewayV2::Api")
+    assert len(apigw.get_routes(ApiId=current_api_id)["Items"]) == 1
+    assert len(apigw.get_integrations(ApiId=current_api_id)["Items"]) == 1
+
+    cfn.delete_stack(StackName=stack_name)
+    _wait_stack(cfn, stack_name)
+
+
 def test_cfn_apigwv2_integration_getatt(cfn, apigw):
     """Fn::GetAtt on IntegrationId resolves correctly."""
     template = {
