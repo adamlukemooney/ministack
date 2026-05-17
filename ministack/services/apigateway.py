@@ -95,6 +95,14 @@ _integrations = AccountScopedDict()  # api_id -> {integration_id -> integration 
 _stages = AccountScopedDict()        # api_id -> {stage_name -> stage object}
 _deployments = AccountScopedDict()   # api_id -> {deployment_id -> deployment object}
 _authorizers = AccountScopedDict()   # api_id -> {authorizer_id -> authorizer object}
+# REQUEST/Lambda authorizer result cache. Real AWS caches by the resolved
+# IdentitySource values for ``AuthorizerResultTtlInSeconds`` seconds so the
+# same caller hitting the same authorizer in quick succession doesn't trigger
+# repeat invocations. Without this our cold-start cost compounds — every
+# request to an HttpApi protected by a CUSTOM authorizer fires a fresh
+# Lambda — and behaviour drifts from production.
+# Key shape: (api_id, authorizer_id, identity_tuple) → (expires_at, allow, context)
+_authorizer_result_cache = AccountScopedDict()
 _api_tags = AccountScopedDict()      # resource_arn -> {key -> value}
 _route_responses = AccountScopedDict()         # api_id -> {route_id -> {rr_id -> route_response}}
 _integration_responses = AccountScopedDict()   # api_id -> {integration_id -> {ir_id -> int_response}}
@@ -556,6 +564,207 @@ def _get_claim(claims: dict, path: str):
     return cur
 
 
+def _resolve_identity_source_values(identity_source, headers: dict, query_params: dict,
+                                     stage_vars: dict, context_vars: dict) -> list[str]:
+    """Resolve a Lambda authorizer's IdentitySource expressions to concrete
+    request values, in declaration order. Returns one entry per source — an
+    empty string for a source that resolved to nothing, so the cache key
+    distinguishes "no value provided" from "value matched another source".
+
+    Real AWS treats a missing required identity-source value as an immediate
+    401 without invoking the authorizer; callers check ``any(values)`` to
+    decide whether to short-circuit.
+    """
+    sources = identity_source if isinstance(identity_source, list) else [identity_source]
+    headers_lc = {k.lower(): v for k, v in (headers or {}).items()}
+    out: list[str] = []
+    for src in sources:
+        if not isinstance(src, str):
+            out.append("")
+            continue
+        if src.startswith("$request.header."):
+            name = src[len("$request.header."):].lower()
+            out.append(headers_lc.get(name, "") or "")
+        elif src.startswith("$request.querystring."):
+            name = src[len("$request.querystring."):]
+            val = (query_params or {}).get(name)
+            if isinstance(val, list):
+                out.append(val[0] if val else "")
+            else:
+                out.append(val or "")
+        elif src.startswith("$stageVariables."):
+            name = src[len("$stageVariables."):]
+            out.append(str((stage_vars or {}).get(name, "") or ""))
+        elif src.startswith("$context."):
+            name = src[len("$context."):]
+            out.append(str(context_vars.get(name, "") or ""))
+        else:
+            out.append("")
+    return out
+
+
+async def _invoke_lambda_request_authorizer(
+    api_id: str, route: dict, authorizer: dict, *,
+    method: str, path: str, stage: str, route_key: str,
+    headers: dict, body: bytes | None, query_params: dict, path_params: dict,
+    stage_vars: dict, context_vars: dict,
+) -> tuple[bool, dict, tuple | None]:
+    """Invoke a REQUEST-type Lambda authorizer for a v2 HttpApi route and
+    parse its response. Returns ``(authorized, context_dict, error_response)``
+    — exactly one of ``authorized=True`` (continue to integration) or
+    ``error_response`` (return that response to the client) is meaningful per
+    call. Honors ``AuthorizerResultTtlInSeconds`` keyed on the resolved
+    IdentitySource values.
+
+    Supports both response shapes:
+
+    - ``EnableSimpleResponses=true``: ``{isAuthorized: bool, context: {...}}``
+    - IAM policy: ``{principalId, policyDocument: {Statement: [...]}, context: {...}}``
+      — Allow on the request's routeArn → authorized.
+    """
+    from ministack.services import lambda_svc
+
+    identity_values = _resolve_identity_source_values(
+        authorizer.get("identitySource", []), headers, query_params, stage_vars, context_vars,
+    )
+    if authorizer.get("identitySource") and not any(identity_values):
+        # Real AWS short-circuits with 401 when a declared identity source is
+        # empty — the authorizer Lambda is never invoked.
+        return False, {}, _jwt_unauthorized()
+
+    authorizer_id = authorizer.get("authorizerId", "")
+    cache_key = (api_id, authorizer_id, tuple(identity_values))
+    ttl = int(authorizer.get("authorizerResultTtlInSeconds") or 0)
+    now = time.time()
+    if ttl > 0:
+        cached = _authorizer_result_cache.get(cache_key)
+        if cached and cached[0] > now:
+            _, allow, ctx = cached
+            if allow:
+                return True, ctx or {}, None
+            return False, {}, _jwt_unauthorized()
+
+    lambda_ref = _extract_lambda_ref_from_integration_uri(authorizer.get("authorizerUri", ""))
+    func_name, qualifier = lambda_svc._resolve_name_and_qualifier(lambda_ref)
+    func_data, func_config = lambda_svc._get_func_record_for_qualifier(func_name, qualifier)
+    if func_data is None:
+        # Treat a misconfigured authorizer as 500 — matches the production
+        # symptom (failed authorizer invoke surfaces an InternalServerError),
+        # not 401 — so the misconfiguration is loud, not silently denying.
+        return False, {}, (
+            500, {"Content-Type": "application/json"},
+            json.dumps({"message": f"Authorizer Lambda '{func_name}' not found"}).encode(),
+        )
+
+    qs = {k: ",".join(v) for k, v in query_params.items()} if query_params else None
+    raw_qs = "&".join(f"{k}={val}" for k, vals in (query_params or {}).items() for val in vals)
+    route_arn = (
+        f"arn:aws:execute-api:{get_region()}:{get_account_id()}:"
+        f"{api_id}/{stage}/{method}{path}"
+    )
+    event = {
+        "version": "2.0",
+        "type": "REQUEST",
+        "routeArn": route_arn,
+        "identitySource": [v for v in identity_values if v],
+        "routeKey": route_key,
+        "rawPath": path,
+        "rawQueryString": raw_qs,
+        "headers": dict(headers),
+        "queryStringParameters": qs,
+        "pathParameters": path_params or None,
+        "stageVariables": stage_vars or None,
+        "requestContext": {
+            "accountId": get_account_id(),
+            "apiId": api_id,
+            "domainName": f"{api_id}.execute-api.{_HOST}",
+            "http": {
+                "method": method,
+                "path": path,
+                "protocol": "HTTP/1.1",
+                "sourceIp": "127.0.0.1",
+                "userAgent": headers.get("user-agent", ""),
+            },
+            "requestId": new_uuid(),
+            "routeKey": route_key,
+            "stage": stage,
+            "time": time.strftime("%d/%b/%Y:%H:%M:%S +0000"),
+            "timeEpoch": int(time.time() * 1000),
+        },
+    }
+
+    exec_record = {"config": func_config, "code_zip": func_data.get("code_zip")}
+    result = await asyncio.to_thread(lambda_svc._execute_function, exec_record, event)
+    if result.get("error"):
+        return False, {}, (
+            500, {"Content-Type": "application/json"},
+            json.dumps({"message": "Authorizer Lambda failed"}).encode(),
+        )
+
+    payload = result.get("body")
+    if isinstance(payload, (bytes, bytearray)):
+        try:
+            payload = json.loads(payload)
+        except Exception:
+            payload = {}
+    elif isinstance(payload, str):
+        try:
+            payload = json.loads(payload)
+        except Exception:
+            payload = {}
+    if not isinstance(payload, dict):
+        payload = {}
+
+    ctx = payload.get("context") if isinstance(payload.get("context"), dict) else {}
+
+    if authorizer.get("enableSimpleResponses"):
+        allow = bool(payload.get("isAuthorized"))
+    else:
+        # IAM-policy response. Allow when any statement Effect=Allow on a
+        # Resource matching the request routeArn. Wildcards in the
+        # statement Resource ARN ("arn:aws:execute-api:...:*/*/*") match
+        # too — the same way real API GW evaluates the policy.
+        allow = False
+        policy = payload.get("policyDocument") or {}
+        for stmt in (policy.get("Statement") or []):
+            if (stmt.get("Effect") or "").lower() != "allow":
+                continue
+            resources = stmt.get("Resource") or []
+            if isinstance(resources, str):
+                resources = [resources]
+            if any(_policy_resource_matches(r, route_arn) for r in resources):
+                allow = True
+                break
+
+    if ttl > 0:
+        _authorizer_result_cache[cache_key] = (now + ttl, allow, ctx)
+
+    if allow:
+        return True, ctx, None
+    return False, {}, _jwt_unauthorized()
+
+
+def _policy_resource_matches(pattern: str, route_arn: str) -> bool:
+    """Match an IAM Resource ARN (with ``*`` wildcards) against the
+    request's routeArn — same shape ``execute-api:Invoke`` uses."""
+    if not isinstance(pattern, str):
+        return False
+    if "*" not in pattern:
+        return pattern == route_arn
+    parts = pattern.split("*")
+    if not route_arn.startswith(parts[0]):
+        return False
+    if not route_arn.endswith(parts[-1]):
+        return False
+    pos = 0
+    for chunk in parts:
+        idx = route_arn.find(chunk, pos)
+        if idx == -1:
+            return False
+        pos = idx + len(chunk)
+    return True
+
+
 async def _validate_jwt_authorizer(route: dict, authorizer: dict, headers: dict, query_params: dict) -> tuple[dict | None, list | None, tuple | None]:
     token = _extract_token_from_identity_source(authorizer.get("identitySource", []), headers, query_params)
     if not token:
@@ -788,6 +997,7 @@ async def handle_execute(api_id, stage, path, method, headers, body, query_param
     auth_type = (route.get("authorizationType") or "NONE").upper()
     authorizer_claims = None
     authorizer_scopes = []
+    lambda_authorizer_context: dict | None = None
     if auth_type == "JWT":
         authorizer_id = route.get("authorizerId")
         if not authorizer_id:
@@ -800,6 +1010,41 @@ async def handle_execute(api_id, stage, path, method, headers, body, query_param
             return auth_error
         authorizer_claims = claims or {}
         authorizer_scopes = scopes or []
+    elif auth_type == "CUSTOM":
+        # ``AuthorizationType=CUSTOM`` on an HttpApi v2 route refers to a
+        # Lambda (REQUEST) authorizer registered as
+        # ``AWS::ApiGatewayV2::Authorizer`` with ``AuthorizerType=REQUEST``.
+        # Pre-fix the dispatcher silently fell through to the integration with
+        # no auth check, which surfaced as either a 500 (handlers that
+        # required ``event.requestContext.authorizer.lambda`` to exist) or a
+        # quietly-unauthenticated request reaching the backend.
+        authorizer_id = route.get("authorizerId")
+        if not authorizer_id:
+            return _jwt_unauthorized()
+        authorizer = _authorizers.get(api_id, {}).get(authorizer_id)
+        if not authorizer:
+            return _jwt_unauthorized()
+        stage_vars_for_auth = _get_stage_variables(api_id, stage)
+        ctx_vars_for_auth = {
+            "requestId": new_uuid(),
+            "httpMethod": method,
+            "path": f"/{stage}{path}",
+            "routeKey": route_key,
+            "stage": stage,
+            "domainName": f"{api_id}.execute-api.{_HOST}",
+        }
+        authorized, lambda_ctx, auth_error = await _invoke_lambda_request_authorizer(
+            api_id, route, authorizer,
+            method=method, path=path, stage=stage, route_key=route_key,
+            headers=request_headers, body=body,
+            query_params=query_params or {}, path_params=path_params or {},
+            stage_vars=stage_vars_for_auth, context_vars=ctx_vars_for_auth,
+        )
+        if auth_error:
+            return auth_error
+        if not authorized:
+            return _jwt_unauthorized()
+        lambda_authorizer_context = lambda_ctx or {}
 
     raw_target = route.get("target", "").replace("integrations/", "")
     # Target is "{integrationId}" — the current Ref / CFN physical ID.
@@ -836,6 +1081,7 @@ async def handle_execute(api_id, stage, path, method, headers, body, query_param
             (path_params or None),
             authorizer_claims=authorizer_claims,
             authorizer_scopes=authorizer_scopes,
+            lambda_authorizer_context=lambda_authorizer_context,
         )
     elif integration_type == "HTTP_PROXY":
         mapped_headers, mapped_query, mapped_path = _apply_request_parameter_mappings(
@@ -968,6 +1214,7 @@ async def _invoke_lambda_proxy(
     *,
     authorizer_claims=None,
     authorizer_scopes=None,
+    lambda_authorizer_context=None,
 ):
     """Invoke a Lambda function using the API Gateway v2 proxy event format."""
     from ministack.services import lambda_svc
@@ -1025,6 +1272,17 @@ async def _invoke_lambda_proxy(
                 "scopes": authorizer_scopes or [],
             }
         }
+    elif lambda_authorizer_context is not None:
+        # AWS surfaces a CUSTOM (REQUEST) authorizer's response context to
+        # the integration as ``event.requestContext.authorizer.lambda``; each
+        # context key becomes a stringified value. Handlers read this to pick
+        # up auth metadata (user id, scopes, tenant, …) the authorizer
+        # decided on their behalf.
+        stringified = {
+            k: v if isinstance(v, str) else json.dumps(v) if isinstance(v, (dict, list)) else str(v)
+            for k, v in (lambda_authorizer_context or {}).items()
+        }
+        event["requestContext"]["authorizer"] = {"lambda": stringified}
 
     # Route through the central _execute_function dispatcher so CloudWatch
     # Logs emission and Docker log output work for API Gateway invocations.
