@@ -260,6 +260,18 @@ def _sqs_delete(physical_id, props):
 def _sns_create(logical_id, props, stack_name):
     name = props.get("TopicName") or _physical_name(stack_name, logical_id, max_len=256)
     arn = f"arn:aws:sns:{get_region()}:{get_account_id()}:{name}"
+    # Idempotent re-create: when the engine falls back to the create handler
+    # on a stack update (no separate update handler is registered for SNS
+    # topics) we must not blow away the existing topic dict — doing so
+    # silently dropped every subscription that had been added since the
+    # initial create and turned the topic into a publish-only black hole
+    # until the next subscription redeploy. Real CFN preserves the topic
+    # across mutable property updates.
+    if arn in _sns._topics:
+        existing = _sns._topics[arn]
+        if "DisplayName" in props:
+            existing["attributes"]["DisplayName"] = props["DisplayName"]
+        return arn, {"TopicArn": arn, "TopicName": name}
     default_policy = json.dumps({
         "Version": "2008-10-17",
         "Id": "__default_policy_ID",
@@ -328,36 +340,68 @@ def _sns_delete(physical_id, props):
 # --- SNS Subscription (standalone) ---
 
 def _sns_sub_create(logical_id, props, stack_name):
+    """Provision an AWS::SNS::Subscription.
+
+    Routed through the SNS service's own ``_create_subscription_impl`` so
+    CFN-driven subscribes behave identically to direct ``sns:Subscribe``
+    API calls: missing topic → CREATE_FAILED (instead of a silently
+    fabricated phantom ARN), same (protocol, endpoint) on the topic →
+    existing ARN returned (idempotent retry), subscription counts on the
+    topic stay accurate, and the full set of attributes
+    (DeliveryPolicy / FilterPolicy / FilterPolicyScope / RawMessageDelivery /
+    RedrivePolicy / SubscriptionRoleArn) round-trips.
+    """
     topic_arn = props.get("TopicArn", "")
     protocol = props.get("Protocol", "")
     endpoint = props.get("Endpoint", "")
-    topic = _sns._topics.get(topic_arn)
-    if not topic:
-        sub_arn = f"{topic_arn}:{new_uuid()}"
-        return sub_arn, {"SubscriptionArn": sub_arn}
 
-    sub_arn = f"{topic_arn}:{new_uuid()}"
     raw = props.get("RawMessageDelivery", False)
     raw_str = "true" if (raw is True or str(raw).lower() == "true") else "false"
-    sub = {
-        "arn": sub_arn,
-        "topic_arn": topic_arn,
-        "protocol": protocol,
-        "endpoint": endpoint,
-        "confirmed": protocol not in ("http", "https"),
-        "owner": get_account_id(),
-        "attributes": {
-            "FilterPolicyScope": props.get("FilterPolicyScope", "MessageAttributes"),
-            "FilterPolicy": (
-                json.dumps(props.get("FilterPolicy"))
-                if isinstance(props.get("FilterPolicy"), (dict, list))
-                else (props.get("FilterPolicy", "") or "")
-            ),
-            "RawMessageDelivery": raw_str,
-        },
+    filter_policy = props.get("FilterPolicy")
+    filter_policy_str = (
+        json.dumps(filter_policy)
+        if isinstance(filter_policy, (dict, list))
+        else (filter_policy or "")
+    )
+    redrive_policy = props.get("RedrivePolicy")
+    redrive_policy_str = (
+        json.dumps(redrive_policy)
+        if isinstance(redrive_policy, (dict, list))
+        else (redrive_policy or "")
+    )
+    delivery_policy = props.get("DeliveryPolicy")
+    delivery_policy_str = (
+        json.dumps(delivery_policy)
+        if isinstance(delivery_policy, (dict, list))
+        else (delivery_policy or "")
+    )
+
+    attributes = {
+        "FilterPolicyScope": props.get("FilterPolicyScope", "MessageAttributes"),
+        "FilterPolicy": filter_policy_str,
+        "RawMessageDelivery": raw_str,
     }
-    topic["subscriptions"].append(sub)
-    _sns._sub_arn_to_topic[sub_arn] = topic_arn
+    if redrive_policy_str:
+        attributes["RedrivePolicy"] = redrive_policy_str
+    if delivery_policy_str:
+        attributes["DeliveryPolicy"] = delivery_policy_str
+    sub_role_arn = props.get("SubscriptionRoleArn")
+    if sub_role_arn:
+        attributes["SubscriptionRoleArn"] = sub_role_arn
+
+    try:
+        sub_arn = _sns._create_subscription_impl(topic_arn, protocol, endpoint, attributes)
+    except _sns._SnsSubscribeError as exc:
+        # Surfacing this as a ValueError lets the CFN engine mark the resource
+        # CREATE_FAILED and roll the stack back — instead of the old silent
+        # phantom-ARN path that left CFN happy but SNS empty.
+        logger.warning(
+            "AWS::SNS::Subscription %s (topic=%s, endpoint=%s): %s",
+            logical_id, topic_arn, endpoint, exc,
+        )
+        raise ValueError(
+            f"AWS::SNS::Subscription {logical_id} could not be created: {exc}"
+        ) from exc
     return sub_arn, {"SubscriptionArn": sub_arn}
 
 
