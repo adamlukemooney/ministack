@@ -3021,23 +3021,36 @@ def _cw_metric_alarm_delete(physical_id, props):
 # ApiGatewayV2 Api
 # ---------------------------------------------------------------------------
 
-def _apigw_v2_cors_config_camel(cfg) -> dict:
-    """CFN templates spell CorsConfiguration's inner fields PascalCase
-    (AllowOrigins, AllowMethods, …) per the AWS CFN spec; the apigateway.py
-    v2 store and the boto3 GetApi response model expect camelCase
-    (allowOrigins, allowMethods, …). Storing the values verbatim left
-    ``get_api`` returning an empty CorsConfiguration, which made every
-    browser preflight fail after deploy until a manual ``update-api`` ran.
+def _apigw_v2_lower_keys(obj):
+    """Shallow-lowercase the first letter of every key in a dict, leaving
+    values untouched. CFN templates spell nested config sub-fields PascalCase
+    per the AWS CFN spec; the apigateway.py v2 store and boto3's
+    apigatewayv2 response models expect camelCase. Storing values verbatim
+    left ``get_api`` / ``get_integration`` / ``get_stage`` returning empty
+    config objects — boto's case-mapping deserialiser couldn't find the
+    lowercase keys it expected. Used for CorsConfiguration, JwtConfiguration,
+    TlsConfig, AccessLogSettings, and the inner objects of DefaultRouteSettings
+    / RouteSettings.
     """
-    if not isinstance(cfg, dict) or not cfg:
-        return {}
+    if not isinstance(obj, dict) or not obj:
+        return {} if obj is None else obj
     out: dict = {}
-    for k, v in cfg.items():
-        if not k:
-            out[k] = v
-            continue
-        out[k[0].lower() + k[1:]] = v
+    for k, v in obj.items():
+        out[k[0].lower() + k[1:] if k else k] = v
     return out
+
+
+def _apigw_v2_cors_config_camel(cfg) -> dict:
+    return _apigw_v2_lower_keys(cfg)
+
+
+def _apigw_v2_route_settings_map_camel(rsmap):
+    """A Stage's per-route ``RouteSettings`` is keyed by route-key strings
+    ("GET /things"); only the inner per-route settings objects need the
+    PascalCase → camelCase normalisation."""
+    if not isinstance(rsmap, dict) or not rsmap:
+        return {} if rsmap is None else rsmap
+    return {rk: _apigw_v2_lower_keys(settings) for rk, settings in rsmap.items()}
 
 
 def _apigw_v2_api_create(logical_id, props, stack_name):
@@ -3166,6 +3179,29 @@ def _apigw_v2_integration_create(logical_id, props, stack_name):
         "responseParameters": props.get("ResponseParameters", {}),
         "contentHandlingStrategy": props.get("ContentHandlingStrategy"),
     }
+    # Flat string fields the previous handler never read — present in the
+    # AWS CFN spec and the boto3 GetIntegration response model, but silently
+    # dropped before. Without IntegrationSubtype, AWS_PROXY service
+    # integrations (Step Functions StartExecution, SQS SendMessage, …) fail
+    # to dispatch; without CredentialsArn, cross-account integrations skip
+    # role assumption; without PassthroughBehavior the runtime can't decide
+    # whether to forward unknown content types to the backend.
+    for prop_key, field in (
+        ("CredentialsArn", "credentialsArn"),
+        ("IntegrationSubtype", "integrationSubtype"),
+        ("PassthroughBehavior", "passthroughBehavior"),
+        ("TemplateSelectionExpression", "templateSelectionExpression"),
+        ("IntegrationResponseSelectionExpression", "integrationResponseSelectionExpression"),
+    ):
+        if props.get(prop_key) is not None:
+            integration[field] = props[prop_key]
+    # Nested PascalCase object — the boto3 GetIntegration response model
+    # expects ``tlsConfig: {serverNameToVerify}``. Storing the CFN-shape
+    # (``TlsConfig: {ServerNameToVerify}``) verbatim left it deserialising
+    # to an empty TlsConfig and the runtime falling back to default SNI
+    # validation against the integration URI host.
+    if props.get("TlsConfig"):
+        integration["tlsConfig"] = _apigw_v2_lower_keys(props["TlsConfig"])
     _apigw_v2._integrations.setdefault(api_id, {})[int_id] = integration
     # AWS returns just the integration ID as the physical ID (Ref).
     # Store apiId in outputs so delete can find the right API.
@@ -3208,9 +3244,19 @@ def _apigw_v2_integration_update(physical_id, old_props, new_props, stack_name):
         ("RequestTemplates", "requestTemplates"),
         ("ResponseParameters", "responseParameters"),
         ("ContentHandlingStrategy", "contentHandlingStrategy"),
+        ("CredentialsArn", "credentialsArn"),
+        ("IntegrationSubtype", "integrationSubtype"),
+        ("PassthroughBehavior", "passthroughBehavior"),
+        ("TemplateSelectionExpression", "templateSelectionExpression"),
+        ("IntegrationResponseSelectionExpression", "integrationResponseSelectionExpression"),
     ):
         if prop_key in new_props:
             existing[field] = new_props[prop_key]
+    if "TlsConfig" in new_props:
+        if new_props["TlsConfig"]:
+            existing["tlsConfig"] = _apigw_v2_lower_keys(new_props["TlsConfig"])
+        else:
+            existing.pop("tlsConfig", None)
     return int_id, {"IntegrationId": int_id, "ApiId": api_id}
 
 
@@ -3231,14 +3277,7 @@ def _apigw_v2_integration_delete(physical_id, props):
 # ---------------------------------------------------------------------------
 
 def _apigw_v2_jwt_config_camel(cfg: dict) -> dict:
-    """JwtConfiguration arrives from CFN with PascalCase keys (Audience,
-    Issuer); the apigateway.py store and boto3 wire format use camelCase."""
-    if not cfg:
-        return {}
-    out = {}
-    for k, v in cfg.items():
-        out[k[0].lower() + k[1:] if k else k] = v
-    return out
+    return _apigw_v2_lower_keys(cfg)
 
 
 def _apigw_v2_authorizer_create(logical_id, props, stack_name):
