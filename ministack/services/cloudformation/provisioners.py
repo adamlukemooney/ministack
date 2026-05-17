@@ -3133,6 +3133,16 @@ def _apigw_v2_api_delete(physical_id, props):
 def _apigw_v2_stage_create(logical_id, props, stack_name):
     api_id = props.get("ApiId", "")
     stage_name = props.get("StageName", "$default")
+    # Idempotent re-create: the CFN engine falls back to this handler on
+    # every update (no separate update handler registered for stages), so
+    # without this guard each redeploy would blow away the stage record
+    # including any settings later mutated via the runtime ``UpdateStage``
+    # call — same destructive pattern as the SNS topic bug fixed earlier
+    # on this branch.
+    stages_for_api = _apigw_v2._stages.setdefault(api_id, {})
+    if stage_name in stages_for_api:
+        return _apigw_v2_stage_apply_props(stages_for_api[stage_name], props), {"StageName": stage_name}
+
     stage = {
         "stageName": stage_name,
         "autoDeploy": props.get("AutoDeploy", False),
@@ -3140,13 +3150,57 @@ def _apigw_v2_stage_create(logical_id, props, stack_name):
         "lastUpdatedDate": now_iso(),
         "stageVariables": props.get("StageVariables", {}),
         "description": props.get("Description", ""),
-        "defaultRouteSettings": props.get("DefaultRouteSettings", {}),
-        "routeSettings": props.get("RouteSettings", {}),
+        "defaultRouteSettings": _apigw_v2_lower_keys(props.get("DefaultRouteSettings") or {}),
+        "routeSettings": _apigw_v2_route_settings_map_camel(props.get("RouteSettings") or {}),
         "tags": props.get("Tags", {}),
     }
-    _apigw_v2._stages.setdefault(api_id, {})[stage_name] = stage
+    # Nested ``AccessLogSettings`` (CFN shape: {DestinationArn, Format})
+    # must arrive at the store as camelCase to round-trip via boto3's
+    # GetStage response model — otherwise HttpApi access logs go nowhere
+    # despite the template being correct.
+    if props.get("AccessLogSettings"):
+        stage["accessLogSettings"] = _apigw_v2_lower_keys(props["AccessLogSettings"])
+    if props.get("ClientCertificateId"):
+        stage["clientCertificateId"] = props["ClientCertificateId"]
+    if props.get("DeploymentId"):
+        stage["deploymentId"] = props["DeploymentId"]
+    stages_for_api[stage_name] = stage
     physical_id = f"{api_id}/{stage_name}"
     return physical_id, {"StageName": stage_name}
+
+
+def _apigw_v2_stage_apply_props(stage: dict, props: dict) -> str:
+    """Mutate an existing stage in place from a fresh set of CFN props.
+    Returns the physical_id string for the (re-routed) ``setdefault`` path."""
+    if "AutoDeploy" in props:
+        stage["autoDeploy"] = props["AutoDeploy"]
+    if "StageVariables" in props:
+        stage["stageVariables"] = props["StageVariables"]
+    if "Description" in props:
+        stage["description"] = props["Description"]
+    if "Tags" in props:
+        stage["tags"] = props["Tags"]
+    if "DefaultRouteSettings" in props:
+        stage["defaultRouteSettings"] = _apigw_v2_lower_keys(props.get("DefaultRouteSettings") or {})
+    if "RouteSettings" in props:
+        stage["routeSettings"] = _apigw_v2_route_settings_map_camel(props.get("RouteSettings") or {})
+    if "AccessLogSettings" in props:
+        if props["AccessLogSettings"]:
+            stage["accessLogSettings"] = _apigw_v2_lower_keys(props["AccessLogSettings"])
+        else:
+            stage.pop("accessLogSettings", None)
+    if "ClientCertificateId" in props:
+        if props["ClientCertificateId"]:
+            stage["clientCertificateId"] = props["ClientCertificateId"]
+        else:
+            stage.pop("clientCertificateId", None)
+    if "DeploymentId" in props:
+        if props["DeploymentId"]:
+            stage["deploymentId"] = props["DeploymentId"]
+        else:
+            stage.pop("deploymentId", None)
+    stage["lastUpdatedDate"] = now_iso()
+    return f"{props.get('ApiId', '')}/{stage['stageName']}"
 
 
 def _apigw_v2_stage_delete(physical_id, props):
