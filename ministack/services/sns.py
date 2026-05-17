@@ -282,26 +282,49 @@ def _set_topic_attributes(params):
 # Subscriptions
 # ---------------------------------------------------------------------------
 
-def _subscribe(params):
-    topic_arn = _normalize_arn(_p(params, "TopicArn"))
-    protocol = _p(params, "Protocol")
-    endpoint = _p(params, "Endpoint")
+class _SnsSubscribeError(Exception):
+    """Raised by ``_create_subscription_impl`` on validation failures so both
+    the query-protocol Subscribe action and the CFN provisioner can surface
+    the same error without re-implementing the checks."""
 
+    def __init__(self, code: str, message: str, http_status: int = 400):
+        super().__init__(message)
+        self.code = code
+        self.http_status = http_status
+
+
+def _create_subscription_impl(
+    topic_arn: str,
+    protocol: str,
+    endpoint: str,
+    attributes: dict | None = None,
+) -> str:
+    """Core subscribe path, shared by the query-protocol Subscribe handler
+    and the AWS::SNS::Subscription CloudFormation provisioner.
+
+    Returns the subscription ARN of the new (or, if (protocol, endpoint)
+    already matches a sibling, the existing) subscription. Raises
+    ``_SnsSubscribeError`` if the topic doesn't exist or the protocol is
+    missing — callers translate that into either an XML error response or a
+    CFN CREATE_FAILED, but never into a silently-fabricated phantom ARN.
+    """
+    topic_arn = _normalize_arn(topic_arn)
     topic = _topics.get(topic_arn)
     if not topic:
-        return _error("NotFound", f"Topic does not exist: {topic_arn}", 404)
-
+        raise _SnsSubscribeError(
+            "NotFound", f"Topic does not exist: {topic_arn}", 404,
+        )
     if not protocol:
-        return _error("InvalidParameterException", "Protocol is required", 400)
+        raise _SnsSubscribeError(
+            "InvalidParameterException", "Protocol is required", 400,
+        )
 
     for existing in topic["subscriptions"]:
         if existing["protocol"] == protocol and existing["endpoint"] == endpoint:
-            return _xml(200, "SubscribeResponse",
-                        f"<SubscribeResult><SubscriptionArn>{existing['arn']}</SubscriptionArn></SubscribeResult>")
+            return existing["arn"]
 
     sub_arn = f"{topic_arn}:{new_uuid()}"
     needs_confirmation = protocol in ("http", "https")
-
     sub = {
         "arn": sub_arn,
         "protocol": protocol,
@@ -323,14 +346,11 @@ def _subscribe(params):
     }
 
     allowed_attrs = {"DeliveryPolicy", "FilterPolicy", "FilterPolicyScope",
-                     "RawMessageDelivery", "RedrivePolicy"}
-    i = 1
-    while _p(params, f"Attributes.entry.{i}.key"):
-        key = _p(params, f"Attributes.entry.{i}.key")
-        val = _p(params, f"Attributes.entry.{i}.value")
-        if key in allowed_attrs:
-            sub["attributes"][key] = val or ""
-        i += 1
+                     "RawMessageDelivery", "RedrivePolicy", "SubscriptionRoleArn"}
+    if attributes:
+        for k, v in attributes.items():
+            if k in allowed_attrs:
+                sub["attributes"][k] = v if v is not None else ""
 
     topic["subscriptions"].append(sub)
     _sub_arn_to_topic[sub_arn] = topic_arn
@@ -339,9 +359,33 @@ def _subscribe(params):
     if needs_confirmation:
         asyncio.ensure_future(_send_subscription_confirmation(topic_arn, sub))
 
-    # Real AWS returns the literal lowercase string "pending confirmation"
-    # (with a space) as the SubscriptionArn until the subscriber confirms.
-    result_arn = "pending confirmation" if needs_confirmation else sub_arn
+    return sub_arn
+
+
+def _subscribe(params):
+    topic_arn = _p(params, "TopicArn")
+    protocol = _p(params, "Protocol")
+    endpoint = _p(params, "Endpoint")
+
+    attributes: dict = {}
+    i = 1
+    while _p(params, f"Attributes.entry.{i}.key"):
+        key = _p(params, f"Attributes.entry.{i}.key")
+        val = _p(params, f"Attributes.entry.{i}.value")
+        attributes[key] = val or ""
+        i += 1
+
+    try:
+        sub_arn = _create_subscription_impl(topic_arn, protocol, endpoint, attributes)
+    except _SnsSubscribeError as e:
+        return _error(e.code, str(e), e.http_status)
+
+    sub = next(
+        (s for s in _topics[_normalize_arn(topic_arn)]["subscriptions"] if s["arn"] == sub_arn),
+        None,
+    )
+    pending = bool(sub and not sub.get("confirmed"))
+    result_arn = "pending confirmation" if pending else sub_arn
     return _xml(200, "SubscribeResponse",
                 f"<SubscribeResult><SubscriptionArn>{result_arn}</SubscriptionArn></SubscribeResult>")
 
