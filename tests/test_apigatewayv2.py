@@ -410,6 +410,242 @@ def test_apigw_execute_lambda_isbase64encoded_response(apigw, lam):
     lam.delete_function(FunctionName=fname)
 
 
+def test_apigw_execute_route_with_custom_authorizer_invokes_authorizer_lambda(apigw, lam):
+    """Regression: HttpApi v2 routes with ``AuthorizationType=CUSTOM`` must
+    invoke the configured REQUEST-type Lambda authorizer before the
+    integration. Pre-fix the dispatch silently fell through to the
+    integration with no auth check at all — handlers that read
+    ``event.requestContext.authorizer.lambda`` 500'd, handlers that didn't
+    served unauthenticated traffic, and the authorizer Lambda's log group
+    never even materialised.
+
+    Exercises both ``EnableSimpleResponses=true`` (the v2-native
+    ``{isAuthorized, context}`` shape) and the IAM-policy shape, and asserts
+    the authorizer's context is forwarded into the integration event as
+    ``requestContext.authorizer.lambda``."""
+    import urllib.error as _urlerr
+    import urllib.request as _urlreq
+    import uuid as _uuid
+
+    from tests.conftest import patch_endpoint_dns
+
+    suffix = _uuid.uuid4().hex[:8]
+    auth_fname = f"intg-authz-{suffix}"
+    integ_fname = f"intg-authz-target-{suffix}"
+
+    # Authorizer Lambda: simple v2 response, allows when Authorization=allow
+    auth_code = (
+        "def handler(event, context):\n"
+        "    auth_hdr = event.get('headers', {}).get('authorization', '')\n"
+        "    return {\n"
+        "        'isAuthorized': auth_hdr == 'allow',\n"
+        "        'context': {'caller': 'alice', 'role': 'admin'},\n"
+        "    }\n"
+    )
+    lam.create_function(
+        FunctionName=auth_fname,
+        Runtime="python3.12",
+        Role="arn:aws:iam::000000000000:role/test-role",
+        Handler="index.handler",
+        Code={"ZipFile": _make_zip(auth_code)},
+    )
+
+    integ_code = (
+        "import json\n"
+        "def handler(event, context):\n"
+        "    rc = event.get('requestContext', {})\n"
+        "    return {\n"
+        "        'statusCode': 200,\n"
+        "        'headers': {'Content-Type': 'application/json'},\n"
+        "        'body': json.dumps({'authorizer': rc.get('authorizer')}),\n"
+        "    }\n"
+    )
+    lam.create_function(
+        FunctionName=integ_fname,
+        Runtime="python3.12",
+        Role="arn:aws:iam::000000000000:role/test-role",
+        Handler="index.handler",
+        Code={"ZipFile": _make_zip(integ_code)},
+    )
+
+    api_id = apigw.create_api(Name=f"authz-{suffix}", ProtocolType="HTTP")["ApiId"]
+    auth_uri = (
+        f"arn:aws:apigateway:us-east-1:lambda:path/2015-03-31/functions/"
+        f"arn:aws:lambda:us-east-1:000000000000:function:{auth_fname}/invocations"
+    )
+    auth_id = apigw.create_authorizer(
+        ApiId=api_id,
+        Name="custom-authz",
+        AuthorizerType="REQUEST",
+        AuthorizerUri=auth_uri,
+        IdentitySource=["$request.header.Authorization"],
+        EnableSimpleResponses=True,
+        AuthorizerPayloadFormatVersion="2.0",
+        AuthorizerResultTtlInSeconds=0,
+    )["AuthorizerId"]
+    int_id = apigw.create_integration(
+        ApiId=api_id,
+        IntegrationType="AWS_PROXY",
+        IntegrationUri=f"arn:aws:lambda:us-east-1:000000000000:function:{integ_fname}",
+        PayloadFormatVersion="2.0",
+    )["IntegrationId"]
+    route_id = apigw.create_route(
+        ApiId=api_id,
+        RouteKey="GET /protected",
+        Target=f"integrations/{int_id}",
+        AuthorizationType="CUSTOM",
+        AuthorizerId=auth_id,
+    )["RouteId"]
+    apigw.create_stage(ApiId=api_id, StageName="$default")
+
+    base = f"http://{api_id}.execute-api.localhost:{_EXECUTE_PORT}/$default/protected"
+
+    with patch_endpoint_dns():
+        # Allow path: authorizer returns isAuthorized=true; integration runs
+        # and receives the authorizer's context as
+        # requestContext.authorizer.lambda.
+        req = _urlreq.Request(base, method="GET")
+        req.add_header("Host", f"{api_id}.execute-api.localhost:{_EXECUTE_PORT}")
+        req.add_header("Authorization", "allow")
+        resp = _urlreq.urlopen(req)
+        assert resp.status == 200
+        body = json.loads(resp.read())
+        lambda_ctx = (body.get("authorizer") or {}).get("lambda") or {}
+        assert lambda_ctx.get("caller") == "alice", (
+            f"integration must receive the authorizer's context under "
+            f"requestContext.authorizer.lambda; got {body}"
+        )
+        assert lambda_ctx.get("role") == "admin"
+
+        # Deny path: authorizer returns isAuthorized=false; the integration
+        # must not run, and the client gets a 401.
+        req = _urlreq.Request(base, method="GET")
+        req.add_header("Host", f"{api_id}.execute-api.localhost:{_EXECUTE_PORT}")
+        req.add_header("Authorization", "deny")
+        try:
+            _urlreq.urlopen(req)
+            assert False, "deny path should have raised"
+        except _urlerr.HTTPError as exc:
+            assert exc.code == 401, f"deny path should be 401, got {exc.code}"
+
+        # Missing identity source: AWS short-circuits to 401 without
+        # invoking the authorizer Lambda. The dispatcher must do the same.
+        req = _urlreq.Request(base, method="GET")
+        req.add_header("Host", f"{api_id}.execute-api.localhost:{_EXECUTE_PORT}")
+        try:
+            _urlreq.urlopen(req)
+            assert False, "missing identity source should have raised"
+        except _urlerr.HTTPError as exc:
+            assert exc.code == 401
+
+    apigw.delete_route(ApiId=api_id, RouteId=route_id)
+    apigw.delete_integration(ApiId=api_id, IntegrationId=int_id)
+    apigw.delete_authorizer(ApiId=api_id, AuthorizerId=auth_id)
+    apigw.delete_api(ApiId=api_id)
+    lam.delete_function(FunctionName=auth_fname)
+    lam.delete_function(FunctionName=integ_fname)
+
+
+def test_apigw_execute_route_custom_authorizer_iam_policy_response(apigw, lam):
+    """The IAM-policy authorizer response shape — used when
+    ``EnableSimpleResponses=false`` — must work too: Allow on the request's
+    routeArn → integration runs; Deny → 401."""
+    import urllib.error as _urlerr
+    import urllib.request as _urlreq
+    import uuid as _uuid
+
+    from tests.conftest import patch_endpoint_dns
+
+    suffix = _uuid.uuid4().hex[:8]
+    auth_fname = f"intg-authz-iam-{suffix}"
+    integ_fname = f"intg-authz-iam-target-{suffix}"
+
+    auth_code = (
+        "def handler(event, context):\n"
+        "    auth_hdr = event.get('headers', {}).get('authorization', '')\n"
+        "    effect = 'Allow' if auth_hdr == 'allow' else 'Deny'\n"
+        "    return {\n"
+        "        'principalId': 'caller-1',\n"
+        "        'policyDocument': {\n"
+        "            'Version': '2012-10-17',\n"
+        "            'Statement': [{\n"
+        "                'Action': 'execute-api:Invoke',\n"
+        "                'Effect': effect,\n"
+        "                'Resource': event['routeArn'],\n"
+        "            }],\n"
+        "        },\n"
+        "        'context': {'tenant': 'acme'},\n"
+        "    }\n"
+    )
+    lam.create_function(
+        FunctionName=auth_fname, Runtime="python3.12",
+        Role="arn:aws:iam::000000000000:role/test-role",
+        Handler="index.handler", Code={"ZipFile": _make_zip(auth_code)},
+    )
+
+    integ_code = (
+        "import json\n"
+        "def handler(event, context):\n"
+        "    rc = event.get('requestContext', {})\n"
+        "    return {'statusCode': 200, 'body': json.dumps({'authorizer': rc.get('authorizer')})}\n"
+    )
+    lam.create_function(
+        FunctionName=integ_fname, Runtime="python3.12",
+        Role="arn:aws:iam::000000000000:role/test-role",
+        Handler="index.handler", Code={"ZipFile": _make_zip(integ_code)},
+    )
+
+    api_id = apigw.create_api(Name=f"authz-iam-{suffix}", ProtocolType="HTTP")["ApiId"]
+    auth_uri = (
+        f"arn:aws:apigateway:us-east-1:lambda:path/2015-03-31/functions/"
+        f"arn:aws:lambda:us-east-1:000000000000:function:{auth_fname}/invocations"
+    )
+    auth_id = apigw.create_authorizer(
+        ApiId=api_id, Name="iam-authz", AuthorizerType="REQUEST",
+        AuthorizerUri=auth_uri,
+        IdentitySource=["$request.header.Authorization"],
+        EnableSimpleResponses=False, AuthorizerPayloadFormatVersion="2.0",
+        AuthorizerResultTtlInSeconds=0,
+    )["AuthorizerId"]
+    int_id = apigw.create_integration(
+        ApiId=api_id, IntegrationType="AWS_PROXY",
+        IntegrationUri=f"arn:aws:lambda:us-east-1:000000000000:function:{integ_fname}",
+        PayloadFormatVersion="2.0",
+    )["IntegrationId"]
+    route_id = apigw.create_route(
+        ApiId=api_id, RouteKey="GET /policy", Target=f"integrations/{int_id}",
+        AuthorizationType="CUSTOM", AuthorizerId=auth_id,
+    )["RouteId"]
+    apigw.create_stage(ApiId=api_id, StageName="$default")
+
+    base = f"http://{api_id}.execute-api.localhost:{_EXECUTE_PORT}/$default/policy"
+
+    with patch_endpoint_dns():
+        req = _urlreq.Request(base, method="GET")
+        req.add_header("Host", f"{api_id}.execute-api.localhost:{_EXECUTE_PORT}")
+        req.add_header("Authorization", "allow")
+        resp = _urlreq.urlopen(req)
+        assert resp.status == 200
+        body = json.loads(resp.read())
+        assert (body.get("authorizer") or {}).get("lambda", {}).get("tenant") == "acme"
+
+        req = _urlreq.Request(base, method="GET")
+        req.add_header("Host", f"{api_id}.execute-api.localhost:{_EXECUTE_PORT}")
+        req.add_header("Authorization", "deny")
+        try:
+            _urlreq.urlopen(req)
+            assert False, "deny policy must produce 401"
+        except _urlerr.HTTPError as exc:
+            assert exc.code == 401
+
+    apigw.delete_route(ApiId=api_id, RouteId=route_id)
+    apigw.delete_integration(ApiId=api_id, IntegrationId=int_id)
+    apigw.delete_authorizer(ApiId=api_id, AuthorizerId=auth_id)
+    apigw.delete_api(ApiId=api_id)
+    lam.delete_function(FunctionName=auth_fname)
+    lam.delete_function(FunctionName=integ_fname)
+
+
 def test_apigw_execute_no_route(apigw):
     """execute-api returns 404 when no matching route exists."""
     import urllib.error as _urlerr
