@@ -3302,6 +3302,14 @@ def _apigw_v2_route_create(logical_id, props, stack_name):
         "requestModels": props.get("RequestModels", {}),
         "requestParameters": props.get("RequestParameters", {}),
     }
+    # AuthorizerId / AuthorizationScopes must travel with AuthorizationType
+    # for CUSTOM/JWT routes; without them the runtime can't resolve which
+    # authorizer to invoke and returns 500 even though the corresponding
+    # Authorizer resource was provisioned correctly alongside the route.
+    if props.get("AuthorizerId"):
+        route["authorizerId"] = props["AuthorizerId"]
+    if props.get("AuthorizationScopes") is not None:
+        route["authorizationScopes"] = list(props["AuthorizationScopes"] or [])
     _apigw_v2._routes.setdefault(api_id, {})[route_id] = route
     physical_id = f"{api_id}/{route_id}"
     return physical_id, {"RouteId": route_id}
@@ -3335,6 +3343,26 @@ def _apigw_v2_route_update(physical_id, old_props, new_props, stack_name):
     existing["authorizationType"] = new_props.get("AuthorizationType", existing.get("authorizationType", "NONE"))
     existing["apiKeyRequired"] = new_props.get("ApiKeyRequired", existing.get("apiKeyRequired", False))
     existing["operationName"] = new_props.get("OperationName", existing.get("operationName", ""))
+    # AuthorizerId / AuthorizationScopes: presence in new_props is authoritative.
+    # When the property is supplied with a value, store it; when it's absent
+    # (e.g. the user changed AuthorizationType to NONE and dropped the
+    # AuthorizerId line from the template), drop the stale field so the route
+    # doesn't keep pointing at a no-longer-referenced authorizer.
+    if "AuthorizerId" in new_props:
+        if new_props["AuthorizerId"]:
+            existing["authorizerId"] = new_props["AuthorizerId"]
+        else:
+            existing.pop("authorizerId", None)
+    else:
+        existing.pop("authorizerId", None)
+    if "AuthorizationScopes" in new_props:
+        scopes = new_props["AuthorizationScopes"]
+        if scopes:
+            existing["authorizationScopes"] = list(scopes)
+        else:
+            existing.pop("authorizationScopes", None)
+    else:
+        existing.pop("authorizationScopes", None)
     if "RequestModels" in new_props:
         existing["requestModels"] = new_props["RequestModels"]
     if "RequestParameters" in new_props:
