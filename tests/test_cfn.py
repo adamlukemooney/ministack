@@ -1754,6 +1754,185 @@ def test_cfn_sns_subscription_raw_message_delivery(cfn, sns, sqs):
     _wait_stack(cfn, stack_name)
 
 
+def test_cfn_sns_subscription_missing_topic_fails_loudly(cfn, sns):
+    """Regression: AWS::SNS::Subscription against a non-existent TopicArn must
+    fail the stack with CREATE_FAILED, not silently return a fabricated
+    ``<topic-arn>:<uuid>`` ARN. The old behaviour produced a phantom resource
+    that CFN reported as CREATE_COMPLETE while SNS held no subscription,
+    breaking every published message to the topic without any error signal."""
+    uid = _uuid_mod.uuid4().hex[:8]
+    stack_name = f"cfn-sns-phantom-{uid}"
+    queue_name = f"cfn-sns-phantom-q-{uid}"
+    ghost_topic_arn = (
+        f"arn:aws:sns:us-east-1:000000000000:nonexistent-topic-{uid}"
+    )
+
+    template = {
+        "AWSTemplateFormatVersion": "2010-09-09",
+        "Resources": {
+            "Q": {
+                "Type": "AWS::SQS::Queue",
+                "Properties": {"QueueName": queue_name},
+            },
+            "GhostSubscription": {
+                "Type": "AWS::SNS::Subscription",
+                "Properties": {
+                    "Protocol": "sqs",
+                    "TopicArn": ghost_topic_arn,
+                    "Endpoint": {"Fn::GetAtt": ["Q", "Arn"]},
+                },
+            },
+        },
+    }
+    cfn.create_stack(StackName=stack_name, TemplateBody=json.dumps(template))
+    stack = _wait_stack(cfn, stack_name)
+    assert stack["StackStatus"] in ("CREATE_FAILED", "ROLLBACK_COMPLETE",
+                                    "ROLLBACK_IN_PROGRESS"), (
+        f"expected stack to fail when subscribing to non-existent topic; "
+        f"got {stack['StackStatus']}: {stack.get('StackStatusReason')}"
+    )
+    # And the topic must still not have a phantom subscription against it.
+    with pytest.raises(ClientError):
+        sns.get_topic_attributes(TopicArn=ghost_topic_arn)
+
+    try:
+        cfn.delete_stack(StackName=stack_name)
+        _wait_stack(cfn, stack_name)
+    except ClientError:
+        pass
+
+
+def test_cfn_sns_subscription_redeploy_is_idempotent(cfn, sns):
+    """Regression: redeploying the same template (same protocol + endpoint)
+    must not accumulate duplicate subscription rows on the topic. The CFN
+    provisioner now routes through the SNS service's idempotent Subscribe
+    path so the second create returns the existing ARN instead of appending
+    a new sibling subscription."""
+    uid = _uuid_mod.uuid4().hex[:8]
+    stack_name = f"cfn-sns-idem-{uid}"
+    queue_name = f"cfn-sns-idem-q-{uid}"
+    topic_name = f"cfn-sns-idem-t-{uid}"
+
+    template = {
+        "AWSTemplateFormatVersion": "2010-09-09",
+        "Resources": {
+            "Q": {"Type": "AWS::SQS::Queue", "Properties": {"QueueName": queue_name}},
+            "T": {"Type": "AWS::SNS::Topic", "Properties": {"TopicName": topic_name}},
+            "S": {
+                "Type": "AWS::SNS::Subscription",
+                "Properties": {
+                    "Protocol": "sqs",
+                    "TopicArn": {"Ref": "T"},
+                    "Endpoint": {"Fn::GetAtt": ["Q", "Arn"]},
+                },
+            },
+        },
+        "Outputs": {
+            "TopicArn": {"Value": {"Ref": "T"}},
+            "SubArn": {"Value": {"Ref": "S"}},
+        },
+    }
+    cfn.create_stack(StackName=stack_name, TemplateBody=json.dumps(template))
+    stack = _wait_stack(cfn, stack_name)
+    assert stack["StackStatus"] == "CREATE_COMPLETE", stack.get("StackStatusReason")
+    outputs = {o["OutputKey"]: o["OutputValue"] for o in stack["Outputs"]}
+    topic_arn = outputs["TopicArn"]
+    initial_sub_arn = outputs["SubArn"]
+    initial_subs = sns.list_subscriptions_by_topic(TopicArn=topic_arn)["Subscriptions"]
+    assert len(initial_subs) == 1
+
+    # Touch a metadata field so CFN treats the resource as updatable; the
+    # subscription itself stays the same (protocol, endpoint, topic).
+    template["Resources"]["S"]["Properties"]["RawMessageDelivery"] = True
+    cfn.update_stack(StackName=stack_name, TemplateBody=json.dumps(template))
+    _wait_stack(cfn, stack_name)
+
+    after_subs = sns.list_subscriptions_by_topic(TopicArn=topic_arn)["Subscriptions"]
+    assert len(after_subs) == 1, (
+        f"redeploying must not append a duplicate subscription; got {after_subs}"
+    )
+    # The returned ARN must still be the original one (idempotent).
+    assert after_subs[0]["SubscriptionArn"] == initial_sub_arn
+
+    cfn.delete_stack(StackName=stack_name)
+    _wait_stack(cfn, stack_name)
+
+
+def test_cfn_cross_stack_import_waits_for_exporter(cfn, sns, sqs):
+    """Regression for the SNS-Subscription-phantom bug at the engine layer:
+    when stack B's template imports a value exported by stack A, stack B
+    must wait for A's exports to materialise before its resources start
+    provisioning. Pre-fix the engine would either fail with "Export not
+    found" on a tight race or — worse, in the SNS Subscription case —
+    silently fabricate a phantom resource because the upstream service
+    store hadn't been populated yet."""
+    uid = _uuid_mod.uuid4().hex[:8]
+    exporter_name = f"cfn-xstack-exp-{uid}"
+    importer_name = f"cfn-xstack-imp-{uid}"
+    topic_name = f"cfn-xstack-topic-{uid}"
+    queue_name = f"cfn-xstack-q-{uid}"
+    export_key = f"XStackTopicArn-{uid}"
+
+    exporter_tpl = {
+        "AWSTemplateFormatVersion": "2010-09-09",
+        "Resources": {
+            "T": {"Type": "AWS::SNS::Topic", "Properties": {"TopicName": topic_name}},
+        },
+        "Outputs": {
+            "TopicArn": {
+                "Value": {"Ref": "T"},
+                "Export": {"Name": export_key},
+            },
+        },
+    }
+    importer_tpl = {
+        "AWSTemplateFormatVersion": "2010-09-09",
+        "Resources": {
+            "Q": {"Type": "AWS::SQS::Queue", "Properties": {"QueueName": queue_name}},
+            "Sub": {
+                "Type": "AWS::SNS::Subscription",
+                "Properties": {
+                    "Protocol": "sqs",
+                    "TopicArn": {"Fn::ImportValue": export_key},
+                    "Endpoint": {"Fn::GetAtt": ["Q", "Arn"]},
+                },
+            },
+        },
+        "Outputs": {
+            "SubArn": {"Value": {"Ref": "Sub"}},
+            "ImportedTopicArn": {"Value": {"Fn::ImportValue": export_key}},
+        },
+    }
+
+    # Fire both create-stacks in quick succession to exercise the cross-stack
+    # race: the importer would previously have raced the exporter's Outputs
+    # population and (for SNS subs specifically) silently produced a phantom
+    # subscription instead of failing or waiting.
+    cfn.create_stack(StackName=exporter_name, TemplateBody=json.dumps(exporter_tpl))
+    cfn.create_stack(StackName=importer_name, TemplateBody=json.dumps(importer_tpl))
+
+    importer = _wait_stack(cfn, importer_name)
+    exporter = _wait_stack(cfn, exporter_name)
+    assert exporter["StackStatus"] == "CREATE_COMPLETE"
+    assert importer["StackStatus"] == "CREATE_COMPLETE", importer.get("StackStatusReason")
+
+    outputs = {o["OutputKey"]: o["OutputValue"] for o in importer["Outputs"]}
+    topic_arn = outputs["ImportedTopicArn"]
+    sub_arn = outputs["SubArn"]
+    # The subscription must actually exist in SNS — the phantom-arn bug had
+    # CFN reporting CREATE_COMPLETE with an ARN that SNS knew nothing about.
+    subs = sns.list_subscriptions_by_topic(TopicArn=topic_arn)["Subscriptions"]
+    assert any(s["SubscriptionArn"] == sub_arn for s in subs), (
+        f"importer's subscription ARN {sub_arn} is not registered on the topic — "
+        f"phantom-subscription regression. Topic has: {subs}"
+    )
+
+    cfn.delete_stack(StackName=importer_name)
+    _wait_stack(cfn, importer_name)
+    cfn.delete_stack(StackName=exporter_name)
+    _wait_stack(cfn, exporter_name)
+
+
 # ===========================================================================
 # CodeBuild Project Tests
 # ===========================================================================
