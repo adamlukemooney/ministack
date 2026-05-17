@@ -1039,7 +1039,14 @@ async def _invoke_lambda_proxy(
     resp_headers = {"Content-Type": "application/json"}
     resp_headers.update(lambda_response.get("headers", {}))
     resp_body = lambda_response.get("body", "")
-    if isinstance(resp_body, str):
+    # Honor isBase64Encoded so handlers can return binary bodies (images, PDFs,
+    # protobuf, etc.) the same way they do on real API Gateway.
+    if lambda_response.get("isBase64Encoded") and isinstance(resp_body, (str, bytes)):
+        if isinstance(resp_body, bytes):
+            resp_body = base64.b64decode(resp_body)
+        else:
+            resp_body = base64.b64decode(resp_body.encode("ascii"))
+    elif isinstance(resp_body, str):
         resp_body = resp_body.encode("utf-8")
     elif isinstance(resp_body, dict):
         resp_body = json.dumps(resp_body, ensure_ascii=False).encode("utf-8")
