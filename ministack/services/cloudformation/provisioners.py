@@ -3164,6 +3164,72 @@ def _apigw_v2_integration_delete(physical_id, props):
 
 
 # ---------------------------------------------------------------------------
+# ApiGatewayV2 Authorizer
+# ---------------------------------------------------------------------------
+
+def _apigw_v2_authorizer_create(logical_id, props, stack_name):
+    """Provision an AWS::ApiGatewayV2::Authorizer.
+
+    Maps CFN properties (PascalCase) to the existing apigateway.py v2
+    authorizer store (camelCase). Covers JWT and REQUEST authorizer types —
+    the same set the HttpApi runtime understands.
+    """
+    api_id = props.get("ApiId", "")
+    data = {
+        "name": props.get("Name", logical_id),
+        "authorizerType": props.get("AuthorizerType", "JWT"),
+        "identitySource": props.get("IdentitySource", ["$request.header.Authorization"]),
+        "jwtConfiguration": props.get("JwtConfiguration", {}),
+        "authorizerUri": props.get("AuthorizerUri", ""),
+        "authorizerPayloadFormatVersion": props.get("AuthorizerPayloadFormatVersion", "2.0"),
+        "authorizerResultTtlInSeconds": props.get("AuthorizerResultTtlInSeconds", 300),
+        "enableSimpleResponses": props.get("EnableSimpleResponses", False),
+        "authorizerCredentialsArn": props.get("AuthorizerCredentialsArn", ""),
+    }
+    status, _headers, body = _apigw_v2._create_authorizer(api_id, data)
+    if status >= 400:
+        raise ValueError(f"AWS::ApiGatewayV2::Authorizer create failed: {body!r}")
+    authorizer = json.loads(body) if isinstance(body, (bytes, bytearray)) else json.loads(body)
+    authorizer_id = authorizer.get("authorizerId", "")
+    return authorizer_id, {"AuthorizerId": authorizer_id, "ApiId": api_id}
+
+
+def _apigw_v2_authorizer_update(physical_id, old_props, new_props, stack_name):
+    """In-place update of an ApiGatewayV2 Authorizer.
+
+    Without this, the engine's update-falls-back-to-create path runs
+    ``_apigw_v2_authorizer_create`` again, which mints a fresh ``AuthorizerId``
+    and leaves the previous authorizer row behind — so each stack redeploy
+    accumulates a duplicate authorizer. Falls back to a fresh create only when
+    the previous physical_id can't be located.
+    """
+    api_id = old_props.get("ApiId") or new_props.get("ApiId", "")
+    existing = _apigw_v2._authorizers.get(api_id, {}).get(physical_id) if api_id else None
+    if existing is None:
+        return _apigw_v2_authorizer_create(physical_id, new_props, stack_name)
+    for prop_key, field in (
+        ("Name", "name"),
+        ("AuthorizerType", "authorizerType"),
+        ("IdentitySource", "identitySource"),
+        ("JwtConfiguration", "jwtConfiguration"),
+        ("AuthorizerUri", "authorizerUri"),
+        ("AuthorizerPayloadFormatVersion", "authorizerPayloadFormatVersion"),
+        ("AuthorizerResultTtlInSeconds", "authorizerResultTtlInSeconds"),
+        ("EnableSimpleResponses", "enableSimpleResponses"),
+        ("AuthorizerCredentialsArn", "authorizerCredentialsArn"),
+    ):
+        if prop_key in new_props:
+            existing[field] = new_props[prop_key]
+    return physical_id, {"AuthorizerId": physical_id, "ApiId": api_id}
+
+
+def _apigw_v2_authorizer_delete(physical_id, props):
+    api_id = props.get("ApiId", "")
+    if api_id:
+        _apigw_v2._authorizers.get(api_id, {}).pop(physical_id, None)
+
+
+# ---------------------------------------------------------------------------
 # ApiGatewayV2 Route
 # ---------------------------------------------------------------------------
 
@@ -3798,6 +3864,7 @@ _RESOURCE_HANDLERS = {
     "AWS::ApiGatewayV2::Stage": {"create": _apigw_v2_stage_create, "delete": _apigw_v2_stage_delete},
     "AWS::ApiGatewayV2::Integration": {"create": _apigw_v2_integration_create, "update": _apigw_v2_integration_update, "delete": _apigw_v2_integration_delete},
     "AWS::ApiGatewayV2::Route": {"create": _apigw_v2_route_create, "update": _apigw_v2_route_update, "delete": _apigw_v2_route_delete},
+    "AWS::ApiGatewayV2::Authorizer": {"create": _apigw_v2_authorizer_create, "update": _apigw_v2_authorizer_update, "delete": _apigw_v2_authorizer_delete},
     "AWS::SES::EmailIdentity": {"create": _ses_email_identity_create, "delete": _ses_email_identity_delete},
     "AWS::WAFv2::WebACL": {"create": _waf_web_acl_create, "delete": _waf_web_acl_delete},
     "AWS::CloudFront::Distribution": {"create": _cf_distribution_create, "delete": _cf_distribution_delete},
