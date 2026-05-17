@@ -3167,6 +3167,17 @@ def _apigw_v2_integration_delete(physical_id, props):
 # ApiGatewayV2 Authorizer
 # ---------------------------------------------------------------------------
 
+def _apigw_v2_jwt_config_camel(cfg: dict) -> dict:
+    """JwtConfiguration arrives from CFN with PascalCase keys (Audience,
+    Issuer); the apigateway.py store and boto3 wire format use camelCase."""
+    if not cfg:
+        return {}
+    out = {}
+    for k, v in cfg.items():
+        out[k[0].lower() + k[1:] if k else k] = v
+    return out
+
+
 def _apigw_v2_authorizer_create(logical_id, props, stack_name):
     """Provision an AWS::ApiGatewayV2::Authorizer.
 
@@ -3179,7 +3190,7 @@ def _apigw_v2_authorizer_create(logical_id, props, stack_name):
         "name": props.get("Name", logical_id),
         "authorizerType": props.get("AuthorizerType", "JWT"),
         "identitySource": props.get("IdentitySource", ["$request.header.Authorization"]),
-        "jwtConfiguration": props.get("JwtConfiguration", {}),
+        "jwtConfiguration": _apigw_v2_jwt_config_camel(props.get("JwtConfiguration", {})),
         "authorizerUri": props.get("AuthorizerUri", ""),
         "authorizerPayloadFormatVersion": props.get("AuthorizerPayloadFormatVersion", "2.0"),
         "authorizerResultTtlInSeconds": props.get("AuthorizerResultTtlInSeconds", 300),
@@ -3211,7 +3222,6 @@ def _apigw_v2_authorizer_update(physical_id, old_props, new_props, stack_name):
         ("Name", "name"),
         ("AuthorizerType", "authorizerType"),
         ("IdentitySource", "identitySource"),
-        ("JwtConfiguration", "jwtConfiguration"),
         ("AuthorizerUri", "authorizerUri"),
         ("AuthorizerPayloadFormatVersion", "authorizerPayloadFormatVersion"),
         ("AuthorizerResultTtlInSeconds", "authorizerResultTtlInSeconds"),
@@ -3220,6 +3230,8 @@ def _apigw_v2_authorizer_update(physical_id, old_props, new_props, stack_name):
     ):
         if prop_key in new_props:
             existing[field] = new_props[prop_key]
+    if "JwtConfiguration" in new_props:
+        existing["jwtConfiguration"] = _apigw_v2_jwt_config_camel(new_props["JwtConfiguration"])
     return physical_id, {"AuthorizerId": physical_id, "ApiId": api_id}
 
 
