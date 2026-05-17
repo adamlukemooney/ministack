@@ -3150,6 +3150,229 @@ def test_cfn_apigwv2_route_propagates_authorizer_id(cfn, apigw):
     _wait_stack(cfn, stack_name)
 
 
+def test_cfn_apigwv2_integration_tls_config_round_trip(cfn, apigw):
+    """Regression: ``AWS::ApiGatewayV2::Integration.TlsConfig`` must round-trip
+    through CFN → get-integration. Pre-fix the provisioner didn't read the
+    property at all; even if it had, the inner ``ServerNameToVerify`` key
+    would have been stored PascalCase and the boto3 response model
+    (which expects ``serverNameToVerify``) would have returned an empty
+    object. Without TlsConfig the runtime can't validate the SNI on a
+    private HTTPS backend, so requests targeting an integration that
+    relied on this fell back to plain TLS verification."""
+    template = {
+        "AWSTemplateFormatVersion": "2010-09-09",
+        "Resources": {
+            "HttpApi": {
+                "Type": "AWS::ApiGatewayV2::Api",
+                "Properties": {"Name": "cfn-apigwv2-tls-t01", "ProtocolType": "HTTP"},
+            },
+            "Integration": {
+                "Type": "AWS::ApiGatewayV2::Integration",
+                "Properties": {
+                    "ApiId": {"Ref": "HttpApi"},
+                    "IntegrationType": "HTTP_PROXY",
+                    "IntegrationUri": "https://backend.internal/api",
+                    "IntegrationMethod": "ANY",
+                    "PayloadFormatVersion": "1.0",
+                    "TlsConfig": {"ServerNameToVerify": "backend.internal"},
+                    "CredentialsArn": "arn:aws:iam::000000000000:role/apigw-invoke",
+                    "PassthroughBehavior": "WHEN_NO_MATCH",
+                },
+            },
+        },
+        "Outputs": {
+            "ApiId": {"Value": {"Ref": "HttpApi"}},
+            "IntegrationId": {"Value": {"Ref": "Integration"}},
+        },
+    }
+    stack_name = "cfn-apigwv2-tls-t01"
+    try:
+        cfn.delete_stack(StackName=stack_name)
+    except Exception:
+        pass
+    cfn.create_stack(StackName=stack_name, TemplateBody=json.dumps(template))
+    _wait_stack(cfn, stack_name)
+    stack = cfn.describe_stacks(StackName=stack_name)["Stacks"][0]
+    outs = {o["OutputKey"]: o["OutputValue"] for o in stack["Outputs"]}
+
+    integ = apigw.get_integration(ApiId=outs["ApiId"], IntegrationId=outs["IntegrationId"])
+    assert integ.get("TlsConfig", {}).get("ServerNameToVerify") == "backend.internal", (
+        f"TlsConfig.ServerNameToVerify dropped: {integ.get('TlsConfig')}"
+    )
+    assert integ.get("CredentialsArn") == "arn:aws:iam::000000000000:role/apigw-invoke"
+    assert integ.get("PassthroughBehavior") == "WHEN_NO_MATCH"
+
+    cfn.delete_stack(StackName=stack_name)
+    _wait_stack(cfn, stack_name)
+
+
+def test_cfn_apigwv2_stage_nested_configs_round_trip(cfn, apigw):
+    """Regression: ``AWS::ApiGatewayV2::Stage`` must round-trip
+    ``AccessLogSettings``, ``DefaultRouteSettings``, and per-route
+    ``RouteSettings`` through CFN → get-stage. Pre-fix the provisioner
+    either dropped these properties (AccessLogSettings was never read at
+    all) or stored them PascalCase verbatim (DefaultRouteSettings /
+    RouteSettings), and the boto3 response model — which expects
+    ``destinationArn`` / ``format`` and ``dataTraceEnabled`` /
+    ``detailedMetricsEnabled`` / ``loggingLevel`` /
+    ``throttlingBurstLimit`` / ``throttlingRateLimit`` — could not
+    deserialise the PascalCase wire fields and returned the configs as
+    empty objects. Net effect: HttpApi access logs went nowhere despite
+    the template being correct, and throttling / metrics overrides on
+    individual routes silently didn't apply."""
+    template = {
+        "AWSTemplateFormatVersion": "2010-09-09",
+        "Resources": {
+            "HttpApi": {
+                "Type": "AWS::ApiGatewayV2::Api",
+                "Properties": {"Name": "cfn-apigwv2-stage-cfg-t01", "ProtocolType": "HTTP"},
+            },
+            "LogGroup": {
+                "Type": "AWS::Logs::LogGroup",
+                "Properties": {"LogGroupName": "cfn-apigwv2-stage-cfg-t01-access"},
+            },
+            "Stage": {
+                "Type": "AWS::ApiGatewayV2::Stage",
+                "Properties": {
+                    "ApiId": {"Ref": "HttpApi"},
+                    "StageName": "v1",
+                    "AutoDeploy": True,
+                    "AccessLogSettings": {
+                        "DestinationArn": {"Fn::GetAtt": ["LogGroup", "Arn"]},
+                        "Format": "$context.requestId $context.routeKey $context.status",
+                    },
+                    "DefaultRouteSettings": {
+                        "DetailedMetricsEnabled": True,
+                        "LoggingLevel": "INFO",
+                        "ThrottlingBurstLimit": 10,
+                        "ThrottlingRateLimit": 20,
+                    },
+                    "RouteSettings": {
+                        "GET /admin": {
+                            "ThrottlingBurstLimit": 1,
+                            "ThrottlingRateLimit": 2,
+                            "LoggingLevel": "ERROR",
+                        },
+                    },
+                    "StageVariables": {"version": "v1"},
+                },
+            },
+        },
+        "Outputs": {
+            "ApiId": {"Value": {"Ref": "HttpApi"}},
+        },
+    }
+    stack_name = "cfn-apigwv2-stage-cfg-t01"
+    try:
+        cfn.delete_stack(StackName=stack_name)
+    except Exception:
+        pass
+    cfn.create_stack(StackName=stack_name, TemplateBody=json.dumps(template))
+    _wait_stack(cfn, stack_name)
+    stack = cfn.describe_stacks(StackName=stack_name)["Stacks"][0]
+    outs = {o["OutputKey"]: o["OutputValue"] for o in stack["Outputs"]}
+
+    stg = apigw.get_stage(ApiId=outs["ApiId"], StageName="v1")
+
+    access = stg.get("AccessLogSettings") or {}
+    assert access.get("Format", "").startswith("$context.requestId"), (
+        f"AccessLogSettings.Format dropped: {access}"
+    )
+    assert "cfn-apigwv2-stage-cfg-t01-access" in (access.get("DestinationArn") or ""), (
+        f"AccessLogSettings.DestinationArn dropped: {access}"
+    )
+
+    default_rs = stg.get("DefaultRouteSettings") or {}
+    assert default_rs.get("DetailedMetricsEnabled") is True, (
+        f"DefaultRouteSettings.DetailedMetricsEnabled dropped: {default_rs}"
+    )
+    assert default_rs.get("LoggingLevel") == "INFO"
+    assert default_rs.get("ThrottlingBurstLimit") == 10
+    assert default_rs.get("ThrottlingRateLimit") == 20
+
+    rs = stg.get("RouteSettings") or {}
+    admin_rs = rs.get("GET /admin") or {}
+    assert admin_rs.get("ThrottlingBurstLimit") == 1, (
+        f"RouteSettings['GET /admin'].ThrottlingBurstLimit dropped: {rs}"
+    )
+    assert admin_rs.get("ThrottlingRateLimit") == 2
+    assert admin_rs.get("LoggingLevel") == "ERROR"
+
+    cfn.delete_stack(StackName=stack_name)
+    _wait_stack(cfn, stack_name)
+
+
+def test_cfn_apigwv2_stage_update_preserves_state(cfn, apigw):
+    """Regression: a stack redeploy that touches an ``AWS::ApiGatewayV2::Stage``
+    must mutate the existing stage in place. Pre-fix the create handler
+    unconditionally wrote ``_stages[api_id][stage_name] = {...}``, so the
+    CFN engine's update-falls-back-to-create path zeroed the stage on every
+    redeploy — anything that had been set via the runtime ``UpdateStage``
+    in the meantime was lost, and the StageName-keyed Ref-able physical
+    ID kept pointing at a dict that lacked any field the new template
+    happened not to mention. Same destructive pattern as the SNS topic
+    bug fixed earlier on this branch."""
+    def _tpl(description: str):
+        return {
+            "AWSTemplateFormatVersion": "2010-09-09",
+            "Resources": {
+                "HttpApi": {
+                    "Type": "AWS::ApiGatewayV2::Api",
+                    "Properties": {"Name": "cfn-apigwv2-stage-upd-t01", "ProtocolType": "HTTP"},
+                },
+                "Stage": {
+                    "Type": "AWS::ApiGatewayV2::Stage",
+                    "Properties": {
+                        "ApiId": {"Ref": "HttpApi"},
+                        "StageName": "v1",
+                        "AutoDeploy": True,
+                        "Description": description,
+                        "DefaultRouteSettings": {
+                            "DetailedMetricsEnabled": True,
+                            "ThrottlingBurstLimit": 50,
+                        },
+                    },
+                },
+            },
+            "Outputs": {"ApiId": {"Value": {"Ref": "HttpApi"}}},
+        }
+
+    stack_name = "cfn-apigwv2-stage-upd-t01"
+    try:
+        cfn.delete_stack(StackName=stack_name)
+    except Exception:
+        pass
+    cfn.create_stack(StackName=stack_name, TemplateBody=json.dumps(_tpl("v1-initial")))
+    _wait_stack(cfn, stack_name)
+    stack = cfn.describe_stacks(StackName=stack_name)["Stacks"][0]
+    api_id = {o["OutputKey"]: o["OutputValue"] for o in stack["Outputs"]}["ApiId"]
+
+    # Mutate stage state via the runtime path — this is what the CDK
+    # `addStage` pattern + a downstream `setStageDescription` lambda
+    # would do, and what the pre-fix engine wiped on redeploy.
+    apigw.update_stage(ApiId=api_id, StageName="v1",
+                       StageVariables={"runtime-set": "yes"})
+
+    cfn.update_stack(
+        StackName=stack_name,
+        TemplateBody=json.dumps(_tpl("v2-redeploy")),
+    )
+    _wait_stack(cfn, stack_name)
+
+    stg = apigw.get_stage(ApiId=api_id, StageName="v1")
+    # Template-controlled fields reflect the redeploy.
+    assert stg["Description"] == "v2-redeploy"
+    # Runtime-set fields survive the redeploy.
+    assert stg.get("StageVariables", {}).get("runtime-set") == "yes", (
+        f"runtime-set StageVariables wiped by redeploy: {stg.get('StageVariables')}"
+    )
+    # Nested config from the template still round-trips correctly.
+    assert stg.get("DefaultRouteSettings", {}).get("DetailedMetricsEnabled") is True
+
+    cfn.delete_stack(StackName=stack_name)
+    _wait_stack(cfn, stack_name)
+
+
 def test_cfn_apigwv2_integration_getatt(cfn, apigw):
     """Fn::GetAtt on IntegrationId resolves correctly."""
     template = {
