@@ -1601,7 +1601,9 @@ def _sm_secret_delete(physical_id, props):
 # --- Cognito UserPool ---
 
 def _cognito_user_pool_create(logical_id, props, stack_name):
-    name = props.get("PoolName") or _physical_name(stack_name, logical_id, max_len=128)
+    # CloudFormation uses UserPoolName; the Cognito SDK shape uses PoolName.
+    # Accept either so templates written against the AWS CFN docs work.
+    name = props.get("UserPoolName") or props.get("PoolName") or _physical_name(stack_name, logical_id, max_len=128)
     pid = _cognito._pool_id()
     now = _cognito._now_epoch()
     pool = {
